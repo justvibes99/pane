@@ -1,0 +1,10 @@
+.build/
+node_modules/
+library/
+assets
+preview.html
+.preview-screenshot.png
+.preview-screenshot-annotated.png
+.versions/
+.user-attachment.png
+.claude/
