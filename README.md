@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="Sources/ligma-logo.png" width="120" />
+  <img src="Sources/pane-logo.png" width="120" />
 </p>
 
-<h1 align="center">Ligma</h1>
+<h1 align="center">Pane</h1>
 
 <p align="center">
   AI-powered design mockup tool for macOS.<br>
@@ -11,7 +11,7 @@
 
 ---
 
-Ligma is a native macOS app that pairs a chat interface with a live preview pane. You describe what you want, Claude builds it as a self-contained HTML file, and you see it render in real-time. Then you iterate — adjust colors, move elements, swap layouts — all through conversation.
+Pane is a native macOS app that pairs a chat interface with a live preview pane. You describe what you want, Claude builds it as a self-contained HTML file, and you see it render in real-time. Then you iterate — adjust colors, move elements, swap layouts — all through conversation.
 
 ## How it works
 
@@ -33,7 +33,7 @@ Ligma is a native macOS app that pairs a chat interface with a live preview pane
 - **Build specs** — export structured specs with component trees, color palettes, and typography
 - **Asset management** — import images, drag & drop onto the preview
 - **Viewport presets** — Auto, Mobile, Tablet, Desktop
-- **Codebase extraction** — point Ligma at a real codebase and it'll analyze the design system
+- **Codebase extraction** — point Pane at a real codebase and it'll analyze the design system
 
 ## Requirements
 
@@ -43,12 +43,12 @@ Ligma is a native macOS app that pairs a chat interface with a live preview pane
 ## Install
 
 ```bash
-git clone https://github.com/justvibes99/ligma.git
-cd ligma
+git clone https://github.com/justvibes99/pane.git
+cd pane
 ./install.sh
 ```
 
-This builds a release binary and assembles `Ligma.app` in `~/Applications/`.
+This builds a release binary and assembles `Pane.app` in `~/Applications/`.
 
 ## Development
 
@@ -66,8 +66,8 @@ The app is a single Swift file (`Sources/MockupApp.swift`) built with Swift Pack
 
 - **SwiftUI + WebKit** — native macOS app with a WKWebView for the live preview
 - **Claude Code CLI** — chat messages are sent to `claude` as a subprocess with `--output-format stream-json`
-- **File-based** — designs are plain `.html` files in `~/ligma/library/{project}/`
-- **Single file** — the entire app is one `MockupApp.swift` file (~7k lines)
+- **File-based** — designs are plain `.html` files in `~/pane/library/{project}/`
+- **Single file** — the entire app is one `MockupApp.swift` file (~8k lines)
 
 ## License
 

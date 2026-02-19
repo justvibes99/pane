@@ -64,6 +64,51 @@ struct ThemeToken: Identifiable {
     let originalValue: String
     var isColor: Bool { value.hasPrefix("#") || value.hasPrefix("rgb") || value.hasPrefix("hsl") }
     var isDirty: Bool { value != originalValue }
+
+    var validationState: TokenValidation {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return .invalid("Empty value") }
+        if isColor {
+            if trimmed.hasPrefix("#") {
+                let hex = String(trimmed.dropFirst())
+                let validLengths = [3, 4, 6, 8]
+                guard validLengths.contains(hex.count),
+                      hex.allSatisfy({ $0.isHexDigit }) else {
+                    return .invalid("Invalid hex color")
+                }
+                return .valid
+            }
+            if trimmed.hasPrefix("rgb") || trimmed.hasPrefix("hsl") {
+                guard trimmed.contains("("), trimmed.contains(")") else {
+                    return .invalid("Missing parentheses")
+                }
+                return .valid
+            }
+        }
+        // Non-color: check balanced parentheses
+        var depth = 0
+        for ch in trimmed {
+            if ch == "(" { depth += 1 }
+            if ch == ")" { depth -= 1 }
+            if depth < 0 { return .invalid("Unbalanced parentheses") }
+        }
+        if depth != 0 { return .invalid("Unbalanced parentheses") }
+        return .valid
+    }
+}
+
+enum TokenValidation: Equatable {
+    case valid, invalid(String)
+
+    var isValid: Bool {
+        if case .valid = self { return true }
+        return false
+    }
+}
+
+struct VersionMeta: Codable {
+    var label: String?
+    var timestamp: Date
 }
 
 // MARK: - Project Types
@@ -77,6 +122,7 @@ struct ProjectInfo: Codable, Identifiable {
     var lastOpenedAt: Date
     var sections: [SectionInfo]
     var extracted: Bool           // true once Claude has analyzed the source
+    var githubRepo: String? = nil  // "owner/repo" if connected to GitHub
 }
 
 struct SectionInfo: Codable, Identifiable {
@@ -107,14 +153,48 @@ struct ThemeTemplate: Identifiable {
 }
 
 enum FontChoice: String, CaseIterable, Identifiable {
-    case system, serif, mono, rounded
+    case system, sansSerif, serif, slab, mono, rounded, humanist, geometric, condensed, custom
     var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .system: return "System"
+        case .sansSerif: return "Sans Serif"
+        case .serif: return "Serif"
+        case .slab: return "Slab Serif"
+        case .mono: return "Monospace"
+        case .rounded: return "Rounded"
+        case .humanist: return "Humanist"
+        case .geometric: return "Geometric"
+        case .condensed: return "Condensed"
+        case .custom: return "Custom..."
+        }
+    }
     var cssValue: String {
         switch self {
         case .system: return "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        case .sansSerif: return "'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif"
         case .serif: return "Georgia, 'Times New Roman', serif"
+        case .slab: return "'Rockwell', 'Courier New', 'Roboto Slab', serif"
         case .mono: return "'SF Mono', 'Fira Code', 'Courier New', monospace"
         case .rounded: return "ui-rounded, 'SF Pro Rounded', system-ui, sans-serif"
+        case .humanist: return "'Gill Sans', 'Optima', 'Trebuchet MS', sans-serif"
+        case .geometric: return "'Futura', 'Century Gothic', 'Avenir', sans-serif"
+        case .condensed: return "'Impact', 'Arial Narrow', 'Roboto Condensed', sans-serif"
+        case .custom: return "var(--custom-font), system-ui, sans-serif"
+        }
+    }
+    var preview: String {
+        switch self {
+        case .system: return "The quick brown fox"
+        case .sansSerif: return "Clean and modern"
+        case .serif: return "Classic elegance"
+        case .slab: return "Bold and sturdy"
+        case .mono: return "Code & data"
+        case .rounded: return "Soft and friendly"
+        case .humanist: return "Warm and readable"
+        case .geometric: return "Sharp and minimal"
+        case .condensed: return "Compact and dense"
+        case .custom: return "Upload font file"
         }
     }
 }
@@ -141,13 +221,42 @@ let themeTemplates: [ThemeTemplate] = [
 // MARK: - Project Helpers
 
 private let libraryBase = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("ligma/library")
+    .appendingPathComponent("pane/library")
 
 func slugify(_ name: String) -> String {
     name.trimmingCharacters(in: .whitespaces).lowercased()
         .replacingOccurrences(of: " ", with: "-")
         .replacingOccurrences(of: "_", with: "-")
         .replacingOccurrences(of: "[^a-z0-9-]", with: "", options: .regularExpression)
+}
+
+/// Find the `gh` CLI path via login shell or known locations
+func findGhCLI() -> String? {
+    let shells = ["/bin/zsh", "/bin/bash"]
+    for shell in shells {
+        let pipe = Pipe()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-lc", "which gh"]
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let path = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !path.isEmpty,
+               FileManager.default.fileExists(atPath: path) {
+                return path
+            }
+        } catch {}
+    }
+    for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+        if FileManager.default.fileExists(atPath: p) { return p }
+    }
+    return nil
 }
 
 func loadProjectInfo(slug: String) -> ProjectInfo? {
@@ -216,8 +325,8 @@ func createProject(name: String, sourcePath: String?) -> ProjectInfo {
 
 // MARK: - Asset Helpers
 
-private let ligmaBase = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("ligma")
+private let paneBase = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("pane")
 
 func assetsDir(for slug: String) -> URL {
     let dir = libraryBase.appendingPathComponent(slug).appendingPathComponent("assets")
@@ -227,7 +336,7 @@ func assetsDir(for slug: String) -> URL {
 
 func activateAssetSymlink(for slug: String) {
     let fm = FileManager.default
-    let symlinkURL = ligmaBase.appendingPathComponent("assets")
+    let symlinkURL = paneBase.appendingPathComponent("assets")
     // Remove existing symlink/file
     try? fm.removeItem(at: symlinkURL)
     let target = assetsDir(for: slug)
@@ -235,7 +344,7 @@ func activateAssetSymlink(for slug: String) {
 }
 
 func deactivateAssetSymlink() {
-    let symlinkURL = ligmaBase.appendingPathComponent("assets")
+    let symlinkURL = paneBase.appendingPathComponent("assets")
     try? FileManager.default.removeItem(at: symlinkURL)
 }
 
@@ -325,16 +434,33 @@ func loadDesignBrief(slug: String) -> String? {
 
 func writeStarterPreview(tokens: [ThemeToken]) {
     let previewURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma/preview.html")
+        .appendingPathComponent("pane/preview.html")
     var cssVars = ""
     for token in tokens {
         cssVars += "  --\(token.name): \(token.value);\n"
     }
-    let fontVar = tokens.first(where: { $0.name == "font-family" })?.value ?? "system-ui, sans-serif"
+    let fontHeading = tokens.first(where: { $0.name == "font-heading" })?.value ?? "system-ui, sans-serif"
+    let fontBody = tokens.first(where: { $0.name == "font-body" })?.value ?? "system-ui, sans-serif"
     let bgVar = tokens.first(where: { $0.name == "color-bg" })?.value ?? "#ffffff"
     let textVar = tokens.first(where: { $0.name == "color-text" })?.value ?? "#1a1a1a"
     let surfaceVar = tokens.first(where: { $0.name == "color-surface" })?.value ?? "#f5f5f5"
     let accentVar = tokens.first(where: { $0.name == "color-accent" })?.value ?? "#0066ff"
+
+    // Check for custom font file
+    var fontFaceCSS = ""
+    let fontsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("pane/fonts")
+    if let files = try? FileManager.default.contentsOfDirectory(at: fontsDir, includingPropertiesForKeys: nil),
+       let fontFile = files.first {
+        let fontName = fontFile.deletingPathExtension().lastPathComponent
+        fontFaceCSS = """
+        @font-face {
+          font-family: '\(fontName)';
+          src: url('fonts/\(fontFile.lastPathComponent)');
+        }
+        :root { --custom-font: '\(fontName)'; }
+        """
+    }
+
     let html = """
     <!DOCTYPE html>
     <html lang="en">
@@ -342,11 +468,12 @@ func writeStarterPreview(tokens: [ThemeToken]) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
+    \(fontFaceCSS)
     :root {
     \(cssVars)}
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: \(fontVar);
+      font-family: \(fontBody);
       background: \(bgVar);
       color: \(textVar);
       min-height: 100vh;
@@ -354,6 +481,7 @@ func writeStarterPreview(tokens: [ThemeToken]) {
       align-items: center;
       justify-content: center;
     }
+    h1, h2, h3, h4, h5, h6 { font-family: \(fontHeading); }
     .card {
       background: \(surfaceVar);
       border-radius: 16px;
@@ -411,6 +539,13 @@ final class AppState {
     var currentVersionIndex = 0
     var isBrowsingHistory = false
     var newVersionsWhileBrowsing = 0
+    var versionMeta: [String: VersionMeta] = [:]
+    var isComparingVersions = false
+    var compareLeftIndex: Int?
+    var compareRightIndex: Int?
+    var editingVersionLabel = false
+    var pendingVersionLabel = ""
+    var editingVersionIndex: Int?
 
     // Design library (sidebar, not modal)
     var showLibrary: Bool {
@@ -456,6 +591,7 @@ final class AppState {
     var currentSectionId: String?
     var showApplySheet = false
     var showRebaseConfirm = false
+    var showConnectGitHub = false
 
     // Asset import
     var showAssetImportConfirmation = false
@@ -541,18 +677,19 @@ extension Notification.Name {
     static let writeThemeToFile = Notification.Name("writeThemeToFile")
     static let activateElementPicker = Notification.Name("activateElementPicker")
     static let deactivateElementPicker = Notification.Name("deactivateElementPicker")
+    static let saveVersionMeta = Notification.Name("saveVersionMeta")
 }
 
 // MARK: - App
 
 @main
-struct LigmaApp: App {
+struct PaneApp: App {
     @State private var state = AppState()
 
     init() {
-        // Single-instance: if another Ligma is already running, activate it and quit
+        // Single-instance: if another Pane is already running, activate it and quit
         let myPID = ProcessInfo.processInfo.processIdentifier
-        let myExec = Bundle.main.executableURL?.lastPathComponent ?? "Ligma"
+        let myExec = Bundle.main.executableURL?.lastPathComponent ?? "Pane"
         if let existing = NSWorkspace.shared.runningApplications.first(where: {
             $0.processIdentifier != myPID &&
             $0.executableURL?.lastPathComponent == myExec
@@ -567,7 +704,7 @@ struct LigmaApp: App {
         if let icnsURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
            let image = NSImage(contentsOf: icnsURL) {
             NSApplication.shared.applicationIconImage = image
-        } else if let url = Bundle.module.url(forResource: "ligma-logo", withExtension: "png"),
+        } else if let url = Bundle.module.url(forResource: "pane-logo", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             image.size = NSSize(width: 512, height: 512)
             NSApplication.shared.applicationIconImage = image
@@ -641,7 +778,7 @@ struct LigmaApp: App {
 
                 Button("Open in Browser") {
                     let url = FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent("ligma/preview.html")
+                        .appendingPathComponent("pane/preview.html")
                     NSWorkspace.shared.open(url)
                 }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
@@ -679,11 +816,11 @@ struct LigmaApp: App {
     }
 }
 
-// MARK: - Ligma Logo (Figma mirrored as L)
+// MARK: - Pane Logo
 
-struct LigmaLogo: View {
+struct PaneLogo: View {
     var body: some View {
-        if let url = Bundle.module.url(forResource: "ligma-logo", withExtension: "png"),
+        if let url = Bundle.module.url(forResource: "pane-logo", withExtension: "png"),
            let nsImage = NSImage(contentsOf: url) {
             Image(nsImage: nsImage)
                 .resizable()
@@ -716,9 +853,9 @@ struct ProjectPickerView: View {
 
                 // Title
                 VStack(spacing: 6) {
-                    LigmaLogo()
+                    PaneLogo()
                         .frame(width: 48, height: 48)
-                    Text("Ligma")
+                    Text("Pane")
                         .font(.system(size: 28, weight: .bold))
                         .foregroundStyle(.white)
                     Text("Design as fast as you build")
@@ -860,68 +997,227 @@ struct NewProjectSheet: View {
 
 // MARK: - Open Codebase Sheet
 
+private struct GHRepo: Codable, Identifiable {
+    let nameWithOwner: String
+    let name: String
+    let description: String?
+    var id: String { nameWithOwner }
+}
+
 struct OpenCodebaseSheet: View {
     @Bindable var state: AppState
+    @State private var mode: CodebaseMode = .local
+    // Local folder state
     @State private var selectedPath: String?
     @State private var name = ""
     @State private var detectedFramework: String?
+    // GitHub state
+    @State private var repos: [GHRepo] = []
+    @State private var searchText = ""
+    @State private var isLoadingRepos = false
+    @State private var selectedRepo: GHRepo?
+    @State private var isCloning = false
+    @State private var ghError: String?
     @Environment(\.dismiss) private var dismiss
+
+    private let teal = Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255)
+    private let cardBg = Color(red: 0x38/255, green: 0x38/255, blue: 0x38/255)
+    private let cardBorder = Color(red: 0x44/255, green: 0x44/255, blue: 0x44/255)
+
+    enum CodebaseMode: String, CaseIterable {
+        case local = "Local Folder"
+        case github = "GitHub"
+    }
+
+    private var filteredRepos: [GHRepo] {
+        if searchText.isEmpty { return repos }
+        let query = searchText.lowercased()
+        return repos.filter {
+            $0.nameWithOwner.lowercased().contains(query) ||
+            ($0.description?.lowercased().contains(query) ?? false)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Open Codebase")
                 .font(.headline)
 
-            if let path = selectedPath {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder.fill")
-                        .foregroundStyle(.secondary)
-                    Text(path.replacingOccurrences(
-                        of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button("Change") { pickFolder() }
-                        .font(.system(size: 11))
+            Picker("", selection: $mode) {
+                ForEach(CodebaseMode.allCases, id: \.self) { m in
+                    Text(m.rawValue).tag(m)
                 }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-                TextField("Project name", text: $name, prompt: Text("e.g. My App"))
-                    .textFieldStyle(.roundedBorder)
-
-                if let fw = detectedFramework {
-                    Label("Detected: \(fw)", systemImage: "checkmark.circle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255))
-                }
-
-                HStack {
-                    Spacer()
-                    Button("Cancel") { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                    Button("Open & Analyze") { openAndAnalyze() }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(slugify(name).isEmpty)
-                }
-            } else {
-                Text("Select a project directory to analyze and reproduce as a visual mockup.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-
-                HStack {
-                    Spacer()
-                    Button("Cancel") { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                    Button("Choose Folder...") { pickFolder() }
-                        .keyboardShortcut(.defaultAction)
-                }
+            switch mode {
+            case .local:
+                localBody
+            case .github:
+                githubBody
             }
         }
         .padding(20)
-        .frame(width: 400)
+        .frame(width: 480, height: mode == .github && !repos.isEmpty ? 440 : nil)
         .onAppear { pickFolder() }
+        .onChange(of: mode) {
+            if mode == .github { fetchRepos() }
+        }
     }
+
+    // MARK: - Local folder tab
+
+    @ViewBuilder
+    private var localBody: some View {
+        if let path = selectedPath {
+            HStack(spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .foregroundStyle(.secondary)
+                Text(path.replacingOccurrences(
+                    of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Button("Change") { pickFolder() }
+                    .font(.system(size: 11))
+            }
+
+            TextField("Project name", text: $name, prompt: Text("e.g. My App"))
+                .textFieldStyle(.roundedBorder)
+
+            if let fw = detectedFramework {
+                Label("Detected: \(fw)", systemImage: "checkmark.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(teal)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Open & Analyze") { openAndAnalyze() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(slugify(name).isEmpty)
+            }
+        } else {
+            Text("Select a project directory to analyze and reproduce as a visual mockup.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Choose Folder...") { pickFolder() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+    }
+
+    // MARK: - GitHub tab
+
+    @ViewBuilder
+    private var githubBody: some View {
+        if isLoadingRepos {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading repositories...")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        } else if repos.isEmpty {
+            if let error = ghError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+        } else {
+            TextField("Search repos...", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(filteredRepos) { repo in
+                        Button {
+                            selectedRepo = repo
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "lock.open")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(repo.nameWithOwner)
+                                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(.primary)
+                                    if let desc = repo.description, !desc.isEmpty {
+                                        Text(desc)
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Spacer()
+                                if selectedRepo?.id == repo.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(teal)
+                                        .font(.system(size: 12))
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(selectedRepo?.id == repo.id
+                                          ? teal.opacity(0.15)
+                                          : Color.clear)
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 240)
+
+            if let error = ghError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+
+            if isCloning {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Cloning repository...")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isCloning)
+                Button("Clone & Open") { cloneAndOpen() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(selectedRepo == nil || isCloning)
+            }
+        }
+    }
+
+    // MARK: - Actions
 
     private func pickFolder() {
         let panel = NSOpenPanel()
@@ -946,6 +1242,328 @@ struct OpenCodebaseSheet: View {
         state.launchMode = .workspace
         dismiss()
     }
+
+    private func fetchRepos() {
+        guard repos.isEmpty, !isLoadingRepos else { return }
+        isLoadingRepos = true
+        ghError = nil
+
+        Task.detached { @Sendable in
+            let gh = findGhCLI()
+            guard let ghPath = gh else {
+                await MainActor.run {
+                    ghError = "GitHub CLI (gh) not found. Install it with: brew install gh"
+                    isLoadingRepos = false
+                }
+                return
+            }
+
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: ghPath)
+            proc.arguments = [
+                "repo", "list", "--json", "name,nameWithOwner,description",
+                "--limit", "200"
+            ]
+            proc.standardOutput = pipe
+            proc.standardError = errPipe
+            proc.standardInput = FileHandle.nullDevice
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+            } catch {
+                await MainActor.run {
+                    ghError = "Failed to run gh: \(error.localizedDescription)"
+                    isLoadingRepos = false
+                }
+                return
+            }
+
+            if proc.terminationStatus != 0 {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Failed to list repos"
+                await MainActor.run {
+                    ghError = errStr
+                    isLoadingRepos = false
+                }
+                return
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let decoded = (try? JSONDecoder().decode([GHRepo].self, from: data)) ?? []
+
+            await MainActor.run {
+                repos = decoded
+                isLoadingRepos = false
+            }
+        }
+    }
+
+    private func cloneAndOpen() {
+        guard let repo = selectedRepo else { return }
+        let slug = slugify(repo.name)
+        guard !slug.isEmpty else { return }
+
+        let repoDir = libraryBase
+            .appendingPathComponent(slug)
+            .appendingPathComponent(".repo")
+
+        let repoId = repo.nameWithOwner
+
+        // If project already exists with a valid clone, just open it
+        if let existing = loadProjectInfo(slug: slug),
+           FileManager.default.fileExists(atPath: repoDir.path) {
+            var updated = existing
+            updated.lastOpenedAt = Date()
+            // Ensure sourcePath/githubRepo are set (in case prior run was partial)
+            if updated.sourcePath == nil { updated.sourcePath = repoDir.path }
+            if updated.githubRepo == nil { updated.githubRepo = repoId }
+            // Reset extraction if no saved versions exist (user didn't save last time)
+            let versDir = libraryBase.appendingPathComponent(slug).appendingPathComponent("versions")
+            let hasVersions = (try? FileManager.default.contentsOfDirectory(atPath: versDir.path))?
+                .contains(where: { $0.hasSuffix(".html") }) ?? false
+            if !hasVersions {
+                updated.extracted = false
+                // Clear stale session so extraction prompt fires
+                let sessionFile = libraryBase.appendingPathComponent(slug).appendingPathComponent("session.json")
+                try? FileManager.default.removeItem(at: sessionFile)
+            }
+            saveProjectInfo(updated)
+            state.currentProject = .project(updated.slug)
+            state.currentProjectInfo = updated
+            state.launchMode = .workspace
+            dismiss()
+            return
+        }
+
+        isCloning = true
+        ghError = nil
+
+        let repoName = repo.name
+
+        Task.detached { @Sendable in
+            let gh = findGhCLI()
+            guard let ghPath = gh else {
+                await MainActor.run {
+                    ghError = "GitHub CLI (gh) not found. Install it with: brew install gh"
+                    isCloning = false
+                }
+                return
+            }
+
+            // Remove leftover .repo dir from a failed prior clone
+            if FileManager.default.fileExists(atPath: repoDir.path) {
+                try? FileManager.default.removeItem(at: repoDir)
+            }
+
+            try? FileManager.default.createDirectory(
+                at: libraryBase.appendingPathComponent(slug),
+                withIntermediateDirectories: true)
+
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: ghPath)
+            proc.arguments = ["repo", "clone", repoId, repoDir.path]
+            proc.standardOutput = pipe
+            proc.standardError = errPipe
+            proc.standardInput = FileHandle.nullDevice
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+            } catch {
+                await MainActor.run {
+                    ghError = "Failed to run gh: \(error.localizedDescription)"
+                    isCloning = false
+                }
+                return
+            }
+
+            if proc.terminationStatus != 0 {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                await MainActor.run {
+                    ghError = errStr
+                    isCloning = false
+                }
+                return
+            }
+
+            let projectName = repoName.replacingOccurrences(of: "-", with: " ").capitalized
+            await MainActor.run {
+                var project = createProject(name: projectName, sourcePath: repoDir.path)
+                project.githubRepo = repoId
+                saveProjectInfo(project)
+                state.currentProject = .project(project.slug)
+                state.currentProjectInfo = project
+                state.launchMode = .workspace
+                isCloning = false
+                dismiss()
+            }
+        }
+    }
+}
+
+// MARK: - Connect GitHub Sheet
+
+struct ConnectGitHubSheet: View {
+    @Bindable var state: AppState
+    @State private var repoInput = ""
+    @State private var isCloning = false
+    @State private var errorMessage: String?
+    @Environment(\.dismiss) private var dismiss
+
+    private let teal = Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255)
+
+    /// Parse "owner/repo" from full URL or short form
+    private var parsedRepo: String? {
+        let trimmed = repoInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+
+        // Handle full GitHub URLs
+        if trimmed.contains("github.com") {
+            // e.g. https://github.com/owner/repo or https://github.com/owner/repo.git
+            let parts = trimmed
+                .replacingOccurrences(of: ".git", with: "")
+                .components(separatedBy: "github.com/")
+            if let path = parts.last {
+                let segments = path.components(separatedBy: "/").filter { !$0.isEmpty }
+                if segments.count >= 2 {
+                    return "\(segments[0])/\(segments[1])"
+                }
+            }
+            return nil
+        }
+
+        // Short form: owner/repo
+        let segments = trimmed.components(separatedBy: "/").filter { !$0.isEmpty }
+        if segments.count == 2 {
+            return trimmed
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Connect to GitHub")
+                .font(.headline)
+
+            Text("Clone a GitHub repo into this project so you can push design changes back on a branch.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            TextField("owner/repo or GitHub URL", text: $repoInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .disabled(isCloning)
+
+            if let repo = parsedRepo {
+                Label(repo, systemImage: "checkmark.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(teal)
+            }
+
+            if let error = errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+
+            if isCloning {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Cloning repository...")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isCloning)
+                Button("Connect") { cloneRepo() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(parsedRepo == nil || isCloning)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+
+    private func cloneRepo() {
+        guard let repo = parsedRepo,
+              let info = state.currentProjectInfo else { return }
+
+        isCloning = true
+        errorMessage = nil
+
+        let repoDir = libraryBase
+            .appendingPathComponent(info.slug)
+            .appendingPathComponent(".repo")
+
+        Task.detached { @Sendable in
+            // Find gh CLI
+            let ghPath = findGhCLI()
+            guard let gh = ghPath else {
+                await MainActor.run {
+                    errorMessage = "GitHub CLI (gh) not found. Install it with: brew install gh"
+                    isCloning = false
+                }
+                return
+            }
+
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: gh)
+            proc.arguments = ["repo", "clone", repo, repoDir.path]
+            proc.standardOutput = pipe
+            proc.standardError = errPipe
+            proc.standardInput = FileHandle.nullDevice
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+            } catch {
+                await MainActor.run {
+                    errorMessage = "Failed to run gh: \(error.localizedDescription)"
+                    isCloning = false
+                }
+                return
+            }
+
+            if proc.terminationStatus != 0 {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                await MainActor.run {
+                    errorMessage = errStr
+                    isCloning = false
+                }
+                return
+            }
+
+            // Success — update project info
+            await MainActor.run {
+                var updated = info
+                updated.sourcePath = repoDir.path
+                updated.githubRepo = repo
+                saveProjectInfo(updated)
+                state.currentProjectInfo = updated
+                isCloning = false
+                dismiss()
+            }
+        }
+    }
+
 }
 
 // MARK: - Open Project Sheet
@@ -953,6 +1571,7 @@ struct OpenCodebaseSheet: View {
 struct OpenProjectSheet: View {
     @Bindable var state: AppState
     @State private var projects: [ProjectInfo] = []
+    @State private var projectToDelete: ProjectInfo?
     @Environment(\.dismiss) private var dismiss
 
     private let cardBg = Color(red: 0x38/255, green: 0x38/255, blue: 0x38/255)
@@ -1021,6 +1640,13 @@ struct OpenProjectSheet: View {
                                 )
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    projectToDelete = project
+                                } label: {
+                                    Label("Delete Project", systemImage: "trash")
+                                }
+                            }
                         }
                     }
                 }
@@ -1038,6 +1664,28 @@ struct OpenProjectSheet: View {
         .onAppear {
             projects = discoverProjects()
         }
+        .alert("Delete Project?", isPresented: Binding(
+            get: { projectToDelete != nil },
+            set: { if !$0 { projectToDelete = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { projectToDelete = nil }
+            Button("Delete", role: .destructive) {
+                if let project = projectToDelete {
+                    deleteProject(project)
+                    projectToDelete = nil
+                }
+            }
+        } message: {
+            if let project = projectToDelete {
+                Text("Delete \"\(project.displayName)\" and all its files? This cannot be undone.")
+            }
+        }
+    }
+
+    private func deleteProject(_ project: ProjectInfo) {
+        let projectDir = libraryBase.appendingPathComponent(project.slug)
+        try? FileManager.default.removeItem(at: projectDir)
+        projects = discoverProjects()
     }
 
     private func openProject(_ project: ProjectInfo) {
@@ -1051,13 +1699,13 @@ struct OpenProjectSheet: View {
 
         // Clear old version history and preview from disk before Coordinator starts
         let fm = FileManager.default
-        let versionsDir = fm.homeDirectoryForCurrentUser.appendingPathComponent("ligma/.versions")
+        let versionsDir = fm.homeDirectoryForCurrentUser.appendingPathComponent("pane/.versions")
         if let files = try? fm.contentsOfDirectory(atPath: versionsDir.path) {
             for file in files where file.hasSuffix(".html") {
                 try? fm.removeItem(at: versionsDir.appendingPathComponent(file))
             }
         }
-        let previewPath = fm.homeDirectoryForCurrentUser.appendingPathComponent("ligma/preview.html").path
+        let previewPath = fm.homeDirectoryForCurrentUser.appendingPathComponent("pane/preview.html").path
         if let fh = FileHandle(forWritingAtPath: previewPath) {
             fh.truncateFile(atOffset: 0)
             fh.closeFile()
@@ -1089,17 +1737,17 @@ struct ContentView: View {
     @State private var previewDebounce: DispatchWorkItem?
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     private let previewPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma/preview.html").path
+        .appendingPathComponent("pane/preview.html").path
 
     private var projectTitle: String {
         switch state.currentProject {
-        case .none: return "Ligma"
-        case .scratch: return "Ligma — Scratch"
+        case .none: return "Pane"
+        case .scratch: return "Pane — Scratch"
         case .project:
             if let name = state.currentProjectInfo?.displayName {
-                return "Ligma — \(name)"
+                return "Pane — \(name)"
             }
-            return "Ligma"
+            return "Pane"
         }
     }
 
@@ -1245,6 +1893,9 @@ struct ContentView: View {
         .sheet(isPresented: $state.showApplySheet) {
             ApplySheet(state: state, chatVM: chatVM)
         }
+        .sheet(isPresented: $state.showConnectGitHub) {
+            ConnectGitHubSheet(state: state)
+        }
         .alert("Rebase from Source?", isPresented: $state.showRebaseConfirm) {
             Button("Rebase") {
                 if let src = state.currentProjectInfo?.sourcePath {
@@ -1324,6 +1975,10 @@ struct ContentView: View {
                 PreviewWebView(state: state, sessionGeneration: state.sessionGeneration)
                     .overlay { SketchOverlay(state: state) }
                     .frame(width: geo.size.width, height: geo.size.height)
+            }
+
+            if state.isComparingVersions {
+                VersionCompareView(state: state)
             }
         }
         .onDrop(of: [.image], isTargeted: nil) { providers in
@@ -1406,7 +2061,7 @@ struct ContentView: View {
     private func saveComponentBack() {
         guard let componentURL = state.editingComponentPath else { return }
         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma/preview.html")
+            .appendingPathComponent("pane/preview.html")
         guard let html = try? String(contentsOf: previewURL, encoding: .utf8) else { return }
         try? html.write(to: componentURL, atomically: true, encoding: .utf8)
         state.lastImportedAssetPath = "Component saved"
@@ -1493,10 +2148,73 @@ struct ContentView: View {
                     .help("Previous (\u{2318}[)")
 
                     if state.isBrowsingHistory {
-                        Text("\(state.currentVersionIndex + 1)/\(state.versions.count)")
-                            .font(.system(size: 10, weight: .medium).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .fixedSize()
+                        let versionFilename = state.versions[state.currentVersionIndex].lastPathComponent
+                        let meta = state.versionMeta[versionFilename]
+                        HStack(spacing: 4) {
+                            Text("\(state.currentVersionIndex + 1)/\(state.versions.count)")
+                                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            if let label = meta?.label, !label.isEmpty {
+                                Text(label)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.yellow)
+                                    .lineLimit(1)
+                            } else if let ts = meta?.timestamp {
+                                Text(relativeTime(from: ts))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .fixedSize()
+                        .contextMenu {
+                            Button("Label this version...") {
+                                state.editingVersionIndex = state.currentVersionIndex
+                                state.pendingVersionLabel = meta?.label ?? ""
+                                state.editingVersionLabel = true
+                            }
+                            Button("Compare with current...") {
+                                state.compareLeftIndex = state.currentVersionIndex
+                                state.compareRightIndex = state.versions.count - 1
+                                state.isComparingVersions = true
+                            }
+                        }
+                        .popover(isPresented: $state.editingVersionLabel) {
+                            VStack(spacing: 8) {
+                                Text("Version Label")
+                                    .font(.system(size: 12, weight: .semibold))
+                                TextField("Label", text: $state.pendingVersionLabel)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 180)
+                                    .onSubmit {
+                                        if let idx = state.editingVersionIndex {
+                                            let fn = state.versions[idx].lastPathComponent
+                                            state.versionMeta[fn] = VersionMeta(
+                                                label: state.pendingVersionLabel.isEmpty ? nil : state.pendingVersionLabel,
+                                                timestamp: state.versionMeta[fn]?.timestamp ?? Date()
+                                            )
+                                            // Save meta via notification since we don't have coordinator ref here
+                                            NotificationCenter.default.post(name: .saveVersionMeta, object: nil)
+                                        }
+                                        state.editingVersionLabel = false
+                                    }
+                                HStack {
+                                    Button("Cancel") { state.editingVersionLabel = false }
+                                    Button("Save") {
+                                        if let idx = state.editingVersionIndex {
+                                            let fn = state.versions[idx].lastPathComponent
+                                            state.versionMeta[fn] = VersionMeta(
+                                                label: state.pendingVersionLabel.isEmpty ? nil : state.pendingVersionLabel,
+                                                timestamp: state.versionMeta[fn]?.timestamp ?? Date()
+                                            )
+                                            NotificationCenter.default.post(name: .saveVersionMeta, object: nil)
+                                        }
+                                        state.editingVersionLabel = false
+                                    }
+                                    .keyboardShortcut(.defaultAction)
+                                }
+                            }
+                            .padding(12)
+                        }
                     } else {
                         Text("\(state.versions.count)")
                             .font(.system(size: 10, weight: .medium).monospacedDigit())
@@ -1646,6 +2364,20 @@ struct ContentView: View {
                     .help("Rebase from Source")
                 }
 
+                // Connect to GitHub (standalone projects only)
+                if case .project = state.currentProject,
+                   state.currentProjectInfo?.sourcePath == nil {
+                    Button {
+                        state.showConnectGitHub = true
+                    } label: {
+                        Image(systemName: "cloud")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Connect to GitHub")
+                }
+
                 // Import assets (project mode only)
                 if case .project = state.currentProject {
                     Button {
@@ -1748,7 +2480,7 @@ struct ContentView: View {
 
                     Button {
                         let url = FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent("ligma/preview.html")
+                            .appendingPathComponent("pane/preview.html")
                         NSWorkspace.shared.open(url)
                     } label: {
                         Label("Open in Browser", systemImage: "arrow.up.right.square")
@@ -2086,7 +2818,7 @@ struct AssetsPopover: View {
             """
         }
         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma/preview.html")
+            .appendingPathComponent("pane/preview.html")
         try? html.write(to: previewURL, atomically: true, encoding: .utf8)
         state.editingComponentPath = url
         state.showAssetsPopover = false
@@ -2108,7 +2840,7 @@ struct SaveSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private let libraryPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma/library")
+        .appendingPathComponent("pane/library")
 
     private var projectSlug: String? {
         let trimmed = project.trimmingCharacters(in: .whitespaces)
@@ -2357,7 +3089,7 @@ struct SaveSheet: View {
         if state.isBrowsingHistory, state.currentVersionIndex < state.versions.count {
             html = (try? String(contentsOf: state.versions[state.currentVersionIndex], encoding: .utf8)) ?? ""
         } else {
-            let previewURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("ligma/preview.html")
+            let previewURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("pane/preview.html")
             html = (try? String(contentsOf: previewURL, encoding: .utf8)) ?? ""
         }
 
@@ -2366,7 +3098,7 @@ struct SaveSheet: View {
 
             // Generate thumbnail from screenshot
             let screenshotURL = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("ligma/.preview-screenshot.png")
+                .appendingPathComponent("pane/.preview-screenshot.png")
             if let srcImage = NSImage(contentsOf: screenshotURL) {
                 let thumbSize = NSSize(width: 120, height: 80)
                 let thumb = NSImage(size: thumbSize)
@@ -2405,12 +3137,48 @@ struct SaveSheet: View {
     }
 }
 
+// MARK: - Component Grouping
+
+struct ComponentGroup: Identifiable {
+    let baseName: String
+    let variants: [String]  // filenames
+    let hasDefaultVariant: Bool  // has a file without --variant suffix
+
+    var id: String { baseName }
+    var displayName: String { baseName.replacingOccurrences(of: "-", with: " ").capitalized }
+    var allFilenames: [String] { variants }
+    var isGroup: Bool { variants.count > 1 || (!hasDefaultVariant && variants.count == 1 && variants[0].contains("--")) }
+}
+
+func groupComponents(_ filenames: [String]) -> [ComponentGroup] {
+    var groups: [String: (variants: [String], hasDefault: Bool)] = [:]
+    for filename in filenames {
+        let name = filename.replacingOccurrences(of: ".html", with: "")
+        if let dashRange = name.range(of: "--") {
+            let base = String(name[name.startIndex..<dashRange.lowerBound])
+            var entry = groups[base] ?? (variants: [], hasDefault: false)
+            entry.variants.append(filename)
+            groups[base] = entry
+        } else {
+            var entry = groups[name] ?? (variants: [], hasDefault: false)
+            entry.variants.append(filename)
+            entry.hasDefault = true
+            groups[name] = entry
+        }
+    }
+    return groups.map { (base, info) in
+        ComponentGroup(baseName: base, variants: info.variants.sorted(), hasDefaultVariant: info.hasDefault)
+    }.sorted { $0.baseName < $1.baseName }
+}
+
 // MARK: - Component Naming Sheet
 
 struct ComponentNamingSheet: View {
     @Bindable var state: AppState
     @State private var name = ""
     @State private var saveGlobally = false
+    @State private var isVariant = false
+    @State private var variantName = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -2420,6 +3188,14 @@ struct ComponentNamingSheet: View {
 
             TextField("Name", text: $name, prompt: Text("e.g. Hero Button"))
                 .textFieldStyle(.roundedBorder)
+
+            Toggle("Save as variant", isOn: $isVariant)
+                .font(.system(size: 12))
+
+            if isVariant {
+                TextField("Variant name", text: $variantName, prompt: Text("e.g. primary"))
+                    .textFieldStyle(.roundedBorder)
+            }
 
             Toggle("Also share globally", isOn: $saveGlobally)
                 .font(.system(size: 12))
@@ -2435,7 +3211,8 @@ struct ComponentNamingSheet: View {
                 .keyboardShortcut(.cancelAction)
                 Button("Save") { saveComponent() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty
+                              || (isVariant && variantName.trimmingCharacters(in: .whitespaces).isEmpty))
             }
         }
         .padding(20)
@@ -2455,15 +3232,22 @@ struct ComponentNamingSheet: View {
             .replacingOccurrences(of: "[^a-z0-9-]", with: "", options: .regularExpression)
         guard !kebab.isEmpty else { return }
 
+        let variantKebab = variantName.trimmingCharacters(in: .whitespaces)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: "[^a-z0-9-]", with: "", options: .regularExpression)
+        let finalName = isVariant && !variantKebab.isEmpty ? "\(kebab)--\(variantKebab)" : kebab
+
         let compsURL = componentsDir(for: slug)
 
         // Save HTML
         if let html = state.pendingComponentHTML {
-            let htmlPath = compsURL.appendingPathComponent("\(kebab).html")
+            let htmlPath = compsURL.appendingPathComponent("\(finalName).html")
             try? html.write(to: htmlPath, atomically: true, encoding: .utf8)
 
             if saveGlobally {
-                let globalPath = globalComponentsDir.appendingPathComponent("\(kebab).html")
+                let globalPath = globalComponentsDir.appendingPathComponent("\(finalName).html")
                 try? html.write(to: globalPath, atomically: true, encoding: .utf8)
             }
         }
@@ -2471,20 +3255,20 @@ struct ComponentNamingSheet: View {
         // Save PNG as thumbnail and to assets
         if let png = state.pendingComponentPNG {
             let assetsURL = assetsDir(for: slug)
-            let pngPath = assetsURL.appendingPathComponent("\(kebab).png")
+            let pngPath = assetsURL.appendingPathComponent("\(finalName).png")
             try? png.write(to: pngPath)
 
             // Also save as component thumbnail
-            let thumbPath = compsURL.appendingPathComponent("\(kebab).thumb.png")
+            let thumbPath = compsURL.appendingPathComponent("\(finalName).thumb.png")
             try? png.write(to: thumbPath)
 
             if saveGlobally {
-                let globalThumb = globalComponentsDir.appendingPathComponent("\(kebab).thumb.png")
+                let globalThumb = globalComponentsDir.appendingPathComponent("\(finalName).thumb.png")
                 try? png.write(to: globalThumb)
             }
 
             // Copy path to clipboard
-            let relativePath = "assets/\(kebab).png"
+            let relativePath = "assets/\(finalName).png"
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(relativePath, forType: .string)
 
@@ -2540,13 +3324,11 @@ struct ComponentPickerPopover: View {
                                     .foregroundStyle(.tertiary)
                                     .padding(.horizontal, 12)
                                     .padding(.top, 4)
-                                ForEach(projectComps, id: \.self) { filename in
-                                    componentPickerRow(
-                                        filename: filename,
-                                        dir: componentsDir(for: slug),
-                                        appState: appState
-                                    )
-                                }
+                                componentGroupList(
+                                    filenames: projectComps,
+                                    dir: componentsDir(for: slug),
+                                    appState: appState
+                                )
                             }
                             if !globalComps.isEmpty {
                                 Text("SHARED")
@@ -2554,13 +3336,11 @@ struct ComponentPickerPopover: View {
                                     .foregroundStyle(.tertiary)
                                     .padding(.horizontal, 12)
                                     .padding(.top, 4)
-                                ForEach(globalComps, id: \.self) { filename in
-                                    componentPickerRow(
-                                        filename: filename,
-                                        dir: globalComponentsDir,
-                                        appState: appState
-                                    )
-                                }
+                                componentGroupList(
+                                    filenames: globalComps,
+                                    dir: globalComponentsDir,
+                                    appState: appState
+                                )
                             }
                         }
                         .padding(.bottom, 8)
@@ -2569,22 +3349,78 @@ struct ComponentPickerPopover: View {
                 }
             }
         }
-        .frame(width: 220)
+        .frame(width: 240)
     }
 
     @ViewBuilder
-    private func componentPickerRow(filename: String, dir: URL, appState: AppState) -> some View {
-        let displayName = filename.replacingOccurrences(of: ".html", with: "")
+    private func componentGroupList(filenames: [String], dir: URL, appState: AppState) -> some View {
+        let groups = groupComponents(filenames)
+        ForEach(groups) { group in
+            if group.isGroup {
+                DisclosureGroup {
+                    ForEach(group.variants, id: \.self) { filename in
+                        componentPickerRow(
+                            filename: filename,
+                            dir: dir,
+                            appState: appState,
+                            displayOverride: variantDisplayName(filename)
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.stack")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        Text(group.displayName)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                        Text("\(group.variants.count)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.secondary.opacity(0.4)))
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 2)
+            } else {
+                ForEach(group.variants, id: \.self) { filename in
+                    componentPickerRow(
+                        filename: filename,
+                        dir: dir,
+                        appState: appState
+                    )
+                }
+            }
+        }
+    }
+
+    private func variantDisplayName(_ filename: String) -> String {
+        let name = filename.replacingOccurrences(of: ".html", with: "")
+        if let dashRange = name.range(of: "--") {
+            let variant = String(name[dashRange.upperBound...])
+            return variant.replacingOccurrences(of: "-", with: " ").capitalized
+        }
+        return name.replacingOccurrences(of: "-", with: " ").capitalized
+    }
+
+    @ViewBuilder
+    private func componentPickerRow(filename: String, dir: URL, appState: AppState, displayOverride: String? = nil) -> some View {
+        let displayName = displayOverride ?? filename.replacingOccurrences(of: ".html", with: "")
             .replacingOccurrences(of: "-", with: " ")
             .capitalized
-        let isAttached = appState.attachedComponents.contains { $0.name == displayName }
+        let attachKey = filename.replacingOccurrences(of: ".html", with: "")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+        let isAttached = appState.attachedComponents.contains { $0.name == attachKey }
         Button {
             if isAttached {
-                appState.attachedComponents.removeAll { $0.name == displayName }
+                appState.attachedComponents.removeAll { $0.name == attachKey }
             } else {
                 let url = dir.appendingPathComponent(filename)
                 if let html = try? String(contentsOf: url, encoding: .utf8) {
-                    appState.attachedComponents.append((name: displayName, html: html))
+                    appState.attachedComponents.append((name: attachKey, html: html))
                 }
             }
         } label: {
@@ -3195,7 +4031,7 @@ struct SpecSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private let libraryPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma/library")
+        .appendingPathComponent("pane/library")
 
     private var slug: String {
         name.trimmingCharacters(in: .whitespaces).lowercased()
@@ -3377,7 +4213,7 @@ struct SpecSheet: View {
         if state.isBrowsingHistory, state.currentVersionIndex < state.versions.count {
             html = (try? String(contentsOf: state.versions[state.currentVersionIndex], encoding: .utf8)) ?? ""
         } else {
-            let previewURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("ligma/preview.html")
+            let previewURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("pane/preview.html")
             html = (try? String(contentsOf: previewURL, encoding: .utf8)) ?? ""
         }
 
@@ -3385,7 +4221,7 @@ struct SpecSheet: View {
         try? html.write(to: dir.appendingPathComponent("reference.html"), atomically: true, encoding: .utf8)
 
         // Copy wireframe screenshot
-        let screenshotURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("ligma/.preview-screenshot.png")
+        let screenshotURL = fm.homeDirectoryForCurrentUser.appendingPathComponent("pane/.preview-screenshot.png")
         let wireframeURL = dir.appendingPathComponent("wireframe.png")
         try? fm.removeItem(at: wireframeURL)
         try? fm.copyItem(at: screenshotURL, to: wireframeURL)
@@ -3433,7 +4269,7 @@ struct ProjectsSidebar: View {
     @State private var renameComponentText = ""
 
     private let libraryPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma/library")
+        .appendingPathComponent("pane/library")
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3655,9 +4491,17 @@ struct ProjectsSidebar: View {
 
     // MARK: Components Tab
 
+    private var filteredComponentProjects: [String] {
+        var all = projectsWithComponents()
+        if case .project(let slug) = state.currentProject {
+            all = all.filter { $0 == slug }
+        }
+        return all
+    }
+
     @ViewBuilder
     private var componentsTab: some View {
-        let projectsWithComps = projectsWithComponents()
+        let projectsWithComps = filteredComponentProjects
         let globalComps = listGlobalComponents()
 
         if projectsWithComps.isEmpty && globalComps.isEmpty {
@@ -3812,13 +4656,19 @@ struct ProjectsSidebar: View {
         try? fm.createDirectory(at: libraryPath, withIntermediateDirectories: true)
         guard let contents = try? fm.contentsOfDirectory(atPath: libraryPath.path) else { return }
         var isDir: ObjCBool = false
-        projects = contents.filter {
+        var all = contents.filter {
             !$0.hasPrefix(".") && !$0.hasPrefix("_") &&
             fm.fileExists(
                 atPath: libraryPath.appendingPathComponent($0).path,
                 isDirectory: &isDir
             ) && isDir.boolValue
         }.sorted()
+
+        // When inside a project, only show that project's files
+        if case .project(let slug) = state.currentProject {
+            all = all.filter { $0 == slug }
+        }
+        projects = all
     }
 
     private func mockupsFor(project: String) -> [String] {
@@ -3860,7 +4710,7 @@ struct ProjectsSidebar: View {
         let url = libraryPath.appendingPathComponent(project).appendingPathComponent(mockup)
         guard let html = try? String(contentsOf: url, encoding: .utf8) else { return }
         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma/preview.html")
+            .appendingPathComponent("pane/preview.html")
         try? html.write(to: previewURL, atomically: true, encoding: .utf8)
         state.showPreview = true
     }
@@ -3873,7 +4723,7 @@ struct ProjectsSidebar: View {
             .appendingPathComponent("reference.html")
         guard let html = try? String(contentsOf: refURL, encoding: .utf8) else { return }
         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma/preview.html")
+            .appendingPathComponent("pane/preview.html")
         try? html.write(to: previewURL, atomically: true, encoding: .utf8)
         state.showPreview = true
     }
@@ -3897,7 +4747,7 @@ struct ProjectsSidebar: View {
             """
         }
         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma/preview.html")
+            .appendingPathComponent("pane/preview.html")
         try? html.write(to: previewURL, atomically: true, encoding: .utf8)
         state.editingComponentPath = url
         state.showPreview = true
@@ -4179,7 +5029,7 @@ struct SpecDetailView: View {
                         let refURL = specDir.appendingPathComponent("reference.html")
                         guard let html = try? String(contentsOf: refURL, encoding: .utf8) else { return }
                         let previewURL = FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent("ligma/preview.html")
+                            .appendingPathComponent("pane/preview.html")
                         try? html.write(to: previewURL, atomically: true, encoding: .utf8)
                         state.showPreview = true
                     }
@@ -4410,6 +5260,10 @@ struct ApplySheet: View {
 
     enum ApplyStep { case preview, applying, done }
 
+    @State private var isPushing = false
+    @State private var pushDone = false
+    @State private var pushError: String?
+
     init(state: AppState, chatVM: ChatViewModel) {
         self.state = state
         self.chatVM = chatVM
@@ -4418,7 +5272,7 @@ struct ApplySheet: View {
             f.dateFormat = "yyyy-MM-dd"
             return f.string(from: Date())
         }()
-        _branchName = State(initialValue: "ligma/design-update-\(dateStr)")
+        _branchName = State(initialValue: "pane/design-update-\(dateStr)")
     }
 
     var body: some View {
@@ -4495,6 +5349,19 @@ struct ApplySheet: View {
                       systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
 
+                if let pushErr = pushError {
+                    Label(pushErr, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                }
+
+                if pushDone {
+                    Label("Pushed to origin/\(branchName)",
+                          systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(teal)
+                }
+
                 HStack(spacing: 8) {
                     if let src = state.currentProjectInfo?.sourcePath {
                         Button("Open in Terminal") {
@@ -4508,6 +5375,32 @@ struct ApplySheet: View {
                             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: src)
                         }
                     }
+
+                    // Push to GitHub (for GitHub-connected projects)
+                    if state.currentProjectInfo?.githubRepo != nil,
+                       let src = state.currentProjectInfo?.sourcePath,
+                       !pushDone {
+                        if isPushing {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Pushing...")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Button("Push to GitHub") {
+                                pushBranch(sourcePath: src)
+                            }
+                        }
+                    }
+
+                    if pushDone, let repo = state.currentProjectInfo?.githubRepo {
+                        Button("Open PR") {
+                            if let url = URL(string: "https://github.com/\(repo)/compare/\(branchName)?expand=1") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+
                     Spacer()
                     Button("Done") { dismiss() }
                         .keyboardShortcut(.defaultAction)
@@ -4517,6 +5410,51 @@ struct ApplySheet: View {
         .padding(20)
         .frame(width: 420)
     }
+
+    private func pushBranch(sourcePath: String) {
+        isPushing = true
+        pushError = nil
+
+        let branch = branchName
+        Task.detached { @Sendable in
+            let gitPath = "/usr/bin/git"
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: gitPath)
+            proc.arguments = ["-C", sourcePath, "push", "-u", "origin", branch]
+            proc.standardOutput = pipe
+            proc.standardError = errPipe
+            proc.standardInput = FileHandle.nullDevice
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+            } catch {
+                await MainActor.run {
+                    pushError = "Failed to run git: \(error.localizedDescription)"
+                    isPushing = false
+                }
+                return
+            }
+
+            if proc.terminationStatus != 0 {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Push failed"
+                await MainActor.run {
+                    pushError = errStr
+                    isPushing = false
+                }
+                return
+            }
+
+            await MainActor.run {
+                isPushing = false
+                pushDone = true
+            }
+        }
+    }
 }
 
 // MARK: - Chat Data Models
@@ -4525,6 +5463,7 @@ struct ChatMessage: Identifiable {
     let id = UUID()
     let role: MessageRole
     var blocks: [ContentBlock]
+    var hidden = false
 
     enum MessageRole { case user, assistant }
 }
@@ -4555,19 +5494,43 @@ enum ConversationState: Equatable {
 final class ChatViewModel {
     var messages: [ChatMessage] = []
     var inputText = ""
+    var searchText = ""
     var state: ConversationState = .idle
     var sessionId: String?
     var modelName: String?
     var totalCost: Double?
+    var turnCount = 0       // number of assistant turns/tool calls in current request
     weak var appState: AppState?
 
     // Image attachment
     var attachedImage: NSImage?
     var attachedImagePath: String?
 
+    var filteredMessages: [ChatMessage] {
+        let visible = messages.filter { !$0.hidden }
+        guard !searchText.trimmingCharacters(in: .whitespaces).isEmpty else { return visible }
+        let query = searchText.lowercased()
+        return visible.filter { msg in
+            msg.blocks.contains { block in
+                switch block {
+                case .text(_, let text): return text.lowercased().contains(query)
+                case .toolUse(_, let name, let input, _): return name.lowercased().contains(query) || input.lowercased().contains(query)
+                case .toolResult(_, _, let content, _): return content.lowercased().contains(query)
+                case .componentRef(_, let names): return names.contains { $0.lowercased().contains(query) }
+                }
+            }
+        }
+    }
+
+    func deleteMessage(_ id: UUID) {
+        messages.removeAll { $0.id == id }
+    }
+
     private var currentProcess: Process?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
+    private var stderrText: String = ""
+    private var gotResult = false
     @ObservationIgnored var _shouldShowResumePrompt = false
 
     private let claudePath: String = {
@@ -4606,7 +5569,7 @@ final class ChatViewModel {
         return "/usr/local/bin/claude"
     }()
     private let workingDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("ligma").path
+        .appendingPathComponent("pane").path
 
     private func saveAnnotatedScreenshotSync() {
         let base = URL(fileURLWithPath: workingDir)
@@ -4637,7 +5600,7 @@ final class ChatViewModel {
 
     private var sessionStatePath: String {
         let base = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma")
+            .appendingPathComponent("pane")
         switch projectContext {
         case .project(let slug):
             return base.appendingPathComponent("library/\(slug)/.session-state.json").path
@@ -4648,7 +5611,7 @@ final class ChatViewModel {
 
     var versionsDir: String {
         let base = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ligma")
+            .appendingPathComponent("pane")
         switch projectContext {
         case .project(let slug):
             return base.appendingPathComponent("library/\(slug)/.versions").path
@@ -4738,33 +5701,202 @@ final class ChatViewModel {
         }
     }
 
-    /// Send extraction prompt for codebase projects
+    /// Send extraction prompt for codebase projects, with pre-read view files inlined
     func sendExtractionPrompt(sourcePath: String) {
+        let viewFiles = collectViewFiles(at: sourcePath)
+        var context = ""
+        if !viewFiles.isEmpty {
+            context = "\n\nHere are the UI/view source files:\n\n"
+            for (path, contents) in viewFiles {
+                let relPath = path.hasPrefix(sourcePath)
+                    ? String(path.dropFirst(sourcePath.count + 1))
+                    : path
+                context += "## \(relPath)\n```\n\(contents)\n```\n\n"
+            }
+        }
+
         let prompt = """
-        Analyze the source code at \(sourcePath). Generate a complete HTML mockup in \
-        preview.html that faithfully reproduces each screen/view in the application. \
-        Use <section id="page-name"> with client-side routing for each screen. \
-        Match the real design system — colors, typography, spacing, component styles. \
-        Use realistic data from the actual app domain.
+        Generate a complete HTML mockup in preview.html that faithfully reproduces each \
+        screen/view in the application at \(sourcePath). Use <section id="page-name"> \
+        with client-side routing for each screen. Match the real design system — colors, \
+        typography, spacing, component styles. Use realistic data from the actual app domain.\
+        \(context)\
+        Write preview.html now — do NOT read any more files unless something is missing.
         """
-        sendMessage(prompt)
+        sendMessage(prompt, hidden: true)
+    }
+
+    /// Collect UI/view files from a source directory, returning [(path, contents)]
+    private func collectViewFiles(at root: String) -> [(String, String)] {
+        let fm = FileManager.default
+        let maxFileSize = 50_000  // skip files over 50KB
+        let maxTotalSize = 400_000 // cap total context at ~400KB
+
+        // Patterns that indicate view/UI files
+        let viewPatterns: [(String, [String])] = [
+            // SwiftUI / UIKit
+            ("swift", ["View", "Screen", "Page", "Controller", "Cell", "ContentView",
+                       "Layout", "Component", "Widget", "Sheet", "Modal", "Tab"]),
+            // React / Vue / Svelte / Angular
+            ("tsx", []),  // all .tsx files are likely components
+            ("jsx", []),
+            ("vue", []),
+            ("svelte", []),
+            // Flutter
+            ("dart", ["screen", "page", "view", "widget", "dialog", "sheet", "layout"]),
+            // General web
+            ("html", []),
+            ("css", []),
+            ("scss", []),
+        ]
+
+        // Also grab specific config/style files
+        let styleFiles = ["tailwind.config", "theme", "colors", "tokens",
+                          "global.css", "globals.css", "app.css", "index.css",
+                          "styles.css", "variables.css"]
+
+        var results: [(String, String)] = []
+        var totalSize = 0
+
+        guard let enumerator = fm.enumerator(atPath: root) else { return [] }
+
+        var candidates: [(String, Int)] = []  // (path, priority) — lower is better
+
+        while let rel = enumerator.nextObject() as? String {
+            // Skip hidden dirs, node_modules, build artifacts
+            let components = rel.components(separatedBy: "/")
+            if components.contains(where: { $0.hasPrefix(".") || $0 == "node_modules" ||
+                $0 == "build" || $0 == "dist" || $0 == ".build" || $0 == "Pods" ||
+                $0 == "DerivedData" || $0 == "__pycache__" }) {
+                continue
+            }
+
+            let fullPath = (root as NSString).appendingPathComponent(rel)
+            let ext = (rel as NSString).pathExtension.lowercased()
+            let filename = (rel as NSString).lastPathComponent.lowercased()
+
+            // Check style/config files
+            if styleFiles.contains(where: { filename.contains($0) }) {
+                candidates.append((fullPath, 0))
+                continue
+            }
+
+            // Check view patterns
+            for (patternExt, keywords) in viewPatterns {
+                if ext == patternExt {
+                    if keywords.isEmpty {
+                        // All files with this extension are relevant (tsx, jsx, vue, etc.)
+                        candidates.append((fullPath, 1))
+                    } else {
+                        let name = (rel as NSString).lastPathComponent
+                        if keywords.contains(where: { name.localizedCaseInsensitiveContains($0) }) {
+                            candidates.append((fullPath, 0))
+                        }
+                    }
+                    break
+                }
+            }
+        }
+
+        // Sort: high-priority first, then alphabetical
+        candidates.sort { ($0.1, $0.0) < ($1.1, $1.0) }
+
+        for (path, _) in candidates {
+            guard totalSize < maxTotalSize else { break }
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let size = attrs[.size] as? Int,
+                  size <= maxFileSize, size > 0 else { continue }
+            guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            results.append((path, contents))
+            totalSize += size
+        }
+
+        return results
     }
 
     /// Send apply-to-project prompt
     func applyToProject(branchName: String, sourcePath: String, changes: String) {
-        let prompt = """
-        Create a new git branch "\(branchName)" in \(sourcePath) and apply the \
-        following design changes to the actual source code:
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
 
-        \(changes)
+        // Load the extraction baseline (what the mockup looked like right after extraction)
+        var baselineHTML = ""
+        if case .project(let slug) = projectContext {
+            let baselinePath = home.appendingPathComponent("pane/library/\(slug)/.extraction-baseline.html")
+            baselineHTML = (try? String(contentsOf: baselinePath, encoding: .utf8)) ?? ""
+        }
 
-        Also read the current preview.html and compare it to the original extraction \
-        to identify any layout/component changes. Apply those changes to the \
-        corresponding source files.
+        // Load the current preview (with the user's design changes)
+        let previewPath = home.appendingPathComponent("pane/preview.html")
+        let currentHTML = (try? String(contentsOf: previewPath, encoding: .utf8)) ?? ""
 
-        Do NOT modify preview.html. Work only in \(sourcePath).
-        Do NOT modify files outside \(sourcePath).
-        Make atomic, reviewable commits.
+        // Detect framework for targeted guidance
+        let framework = detectFramework(at: sourcePath) ?? "Unknown"
+
+        var prompt = """
+        You are applying design changes from an HTML mockup back to the real source code.
+
+        **Step 1: Create branch**
+        Run: git -C \(sourcePath) checkout -b \(branchName)
+
+        **Step 2: Identify changes**
+        Below are two versions of the HTML mockup. The BASELINE is the original extraction \
+        from the source code. The CURRENT is after the user's design edits. \
+        Diff them carefully and list every visual change (colors, spacing, typography, \
+        layout, text content, new/removed elements, reordering).
+
+        """
+
+        if !baselineHTML.isEmpty {
+            // Truncate to avoid blowing up the prompt — keep first 30K chars of each
+            let maxLen = 30000
+            let baseline = baselineHTML.count > maxLen ? String(baselineHTML.prefix(maxLen)) + "\n<!-- truncated -->" : baselineHTML
+            let current = currentHTML.count > maxLen ? String(currentHTML.prefix(maxLen)) + "\n<!-- truncated -->" : currentHTML
+
+            prompt += """
+            <baseline-mockup>
+            \(baseline)
+            </baseline-mockup>
+
+            <current-mockup>
+            \(current)
+            </current-mockup>
+
+            """
+        } else {
+            prompt += """
+            No baseline available. Read preview.html to see the current mockup state.
+
+            """
+        }
+
+        if !changes.isEmpty && changes != "Visual/layout changes from the mockup" {
+            prompt += """
+            **Known token changes:**
+            \(changes)
+
+            """
+        }
+
+        prompt += """
+        **Step 3: Apply to source code**
+        The project is \(framework) at \(sourcePath). For each change identified in Step 2:
+        - Find the corresponding source file and code location
+        - Make the equivalent change in the framework's idiom (e.g. SwiftUI modifiers, \
+        CSS classes, React props, Flutter widgets)
+        - Colors: map hex values to the framework's color system
+        - Spacing/sizing: translate px values to the framework's units
+        - Typography: map font-family/size/weight to framework equivalents
+        - Layout changes: adjust the component tree structure accordingly
+
+        **Step 4: Commit**
+        Make one atomic commit with a descriptive message summarizing the design changes.
+
+        **Rules:**
+        - Do NOT modify preview.html
+        - Do NOT modify files outside \(sourcePath)
+        - Before editing each file, read it first to understand the current code
+        - If a change cannot be mapped to source code (e.g. mockup-only decoration), skip it
         """
         sendMessage(prompt)
     }
@@ -4800,7 +5932,7 @@ final class ChatViewModel {
         NotificationCenter.default.post(name: .clearSession, object: nil)
     }
 
-    func sendMessage(_ text: String) {
+    func sendMessage(_ text: String, hidden: Bool = false) {
         var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         inputText = ""
@@ -4812,15 +5944,34 @@ final class ChatViewModel {
             attachedImagePath = nil
         }
 
-        // Prepend design brief on first message of a new session
-        if sessionId == nil,
-           case .project(let slug) = projectContext,
-           let brief = loadDesignBrief(slug: slug) {
-            trimmed = "[Design Brief:\n\(brief)]\n\n" + trimmed
-        }
-
-        // Prepend attached component HTML (only to prompt, not displayed message)
+        // Capture display text before injecting hidden context
         let displayText = trimmed
+
+        // Prepend design brief on first message of a new session
+        if sessionId == nil {
+            // Try saved brief from project
+            var brief: String? = nil
+            if case .project(let slug) = projectContext {
+                brief = loadDesignBrief(slug: slug)
+            }
+            // Fall back to live state (tokens + instructions)
+            if brief == nil, let appState {
+                var parts: [String] = []
+                if !appState.themeTokens.isEmpty {
+                    let tokenLines = appState.themeTokens.map { "  --\($0.name): \($0.value)" }.joined(separator: "\n")
+                    parts.append("Design tokens (use as CSS custom properties):\n\(tokenLines)")
+                }
+                if !appState.designInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    parts.append("Style direction: \(appState.designInstructions)")
+                }
+                if !parts.isEmpty {
+                    brief = parts.joined(separator: "\n\n")
+                }
+            }
+            if let brief {
+                trimmed = "[Design Brief:\n\(brief)]\n\n" + trimmed
+            }
+        }
         var componentNames: [String] = []
         if let components = appState?.attachedComponents, !components.isEmpty {
             componentNames = components.map { $0.name }
@@ -4838,7 +5989,10 @@ final class ChatViewModel {
             blocks.append(.componentRef(names: componentNames))
         }
         blocks.append(.text(text: displayText))
-        messages.append(ChatMessage(role: .user, blocks: blocks))
+        messages.append(ChatMessage(role: .user, blocks: blocks, hidden: hidden))
+        turnCount = 0
+        stderrText = ""
+        gotResult = false
         state = .launching
 
         // Save annotated screenshot synchronously before launching claude
@@ -4910,12 +6064,13 @@ final class ChatViewModel {
             DispatchQueue.main.async { self?.processDidExit() }
         }
 
-        // Log stderr for debugging
+        // Capture stderr for error display
         let errHandle = errPipe.fileHandleForReading
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             let data = errHandle.readDataToEndOfFile()
             if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
-                NSLog("[Ligma] stderr: %@", text)
+                NSLog("[Pane] stderr: %@", text)
+                DispatchQueue.main.async { self?.stderrText = text }
             }
         }
     }
@@ -4929,12 +6084,30 @@ final class ChatViewModel {
     private func processDidExit() {
         currentProcess = nil
         if case .error = state { return }
+        if !gotResult {
+            // Process exited without producing a result — show stderr
+            let errMsg = stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !errMsg.isEmpty {
+                messages.append(ChatMessage(role: .assistant, blocks: [.text(text: "Error: \(errMsg)")]))
+                state = .error(errMsg)
+            } else {
+                messages.append(ChatMessage(role: .assistant, blocks: [.text(text: "Claude process exited unexpectedly.")]))
+                state = .error("Process exited unexpectedly")
+            }
+            return
+        }
         state = .idle
     }
 
     private func handleStreamLine(_ line: String) {
         guard let data = line.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // Non-JSON output — likely an error message
+            if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                stderrText += line + "\n"
+            }
+            return
+        }
 
         let type = json["type"] as? String ?? ""
 
@@ -4958,10 +6131,25 @@ final class ChatViewModel {
             handleUserMessage(json)
 
         case "result":
+            gotResult = true
             if let costInfo = json["total_cost_usd"] as? Double {
                 totalCost = costInfo
             }
-            state = .idle
+            if let errMsg = (json["error"] as? [String: Any])?["message"] as? String
+                ?? json["error"] as? String {
+                messages.append(ChatMessage(role: .assistant, blocks: [.text(text: "Error: \(errMsg)")]))
+                state = .error(errMsg)
+            } else {
+                state = .idle
+            }
+
+        case "error":
+            let errMsg = (json["error"] as? [String: Any])?["message"] as? String
+                ?? json["error"] as? String
+                ?? json["message"] as? String
+                ?? "Unknown error"
+            messages.append(ChatMessage(role: .assistant, blocks: [.text(text: "Error: \(errMsg)")]))
+            state = .error(errMsg)
 
         default:
             break
@@ -4992,6 +6180,7 @@ final class ChatViewModel {
                     inputStr = "{}"
                 }
                 blocks.append(.toolUse(toolName: name, toolInput: inputStr, toolUseId: toolId))
+                turnCount += 1
                 state = .toolRunning(friendlyToolName(name))
             default:
                 break
@@ -5068,24 +6257,36 @@ struct ChatView: View {
         VStack(spacing: 0) {
             // Activity indicator bar
             if viewModel.isRunning {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(activityLabel)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color(red: 0xB3/255, green: 0xB3/255, blue: 0xB3/255))
-                    Spacer()
-                    Button {
-                        viewModel.stop()
-                    } label: {
-                        Text("Stop")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(Color(red: 255/255, green: 107/255, blue: 107/255))
+                VStack(spacing: 0) {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(activityLabel)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color(red: 0xB3/255, green: 0xB3/255, blue: 0xB3/255))
+                        Spacer()
+                        Button {
+                            viewModel.stop()
+                        } label: {
+                            Text("Stop")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color(red: 255/255, green: 107/255, blue: 107/255))
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+
+                    // Progress bar — asymptotic curve: fast start, slows as it approaches 100%
+                    GeometryReader { geo in
+                        let progress = 1.0 - 1.0 / (1.0 + Double(viewModel.turnCount) * 0.15)
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(accentTeal)
+                            .frame(width: geo.size.width * progress, height: 2)
+                            .animation(.easeOut(duration: 0.4), value: viewModel.turnCount)
+                    }
+                    .frame(height: 2)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
                 .background(Color(red: 0x33/255, green: 0x33/255, blue: 0x33/255))
             }
 
@@ -5103,6 +6304,31 @@ struct ChatView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(Color.orange)
+            }
+
+            // Search bar
+            if !viewModel.messages.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    TextField("Search messages...", text: $viewModel.searchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                    if !viewModel.searchText.isEmpty {
+                        Button {
+                            viewModel.searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(red: 0x2A/255, green: 0x2A/255, blue: 0x2A/255))
             }
 
             if viewModel.messages.isEmpty {
@@ -5167,8 +6393,10 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(viewModel.messages) { message in
-                        MessageRow(message: message)
+                    ForEach(viewModel.filteredMessages) { message in
+                        MessageRow(message: message, onDelete: {
+                            viewModel.deleteMessage(message.id)
+                        })
                             .id(message.id)
                     }
                 }
@@ -5198,6 +6426,7 @@ struct ChatView: View {
 
 struct MessageRow: View {
     let message: ChatMessage
+    var onDelete: (() -> Void)?
 
     private let userBubbleBg = Color(red: 0x38/255, green: 0x38/255, blue: 0x38/255)
 
@@ -5216,6 +6445,11 @@ struct MessageRow: View {
             }
         }
         .padding(.vertical, 4)
+        .contextMenu {
+            if let onDelete {
+                Button("Delete", role: .destructive) { onDelete() }
+            }
+        }
     }
 
     @ViewBuilder
@@ -5615,7 +6849,7 @@ struct ChatInputBar: View {
                             guard let data, error == nil,
                                   let image = NSImage(data: data) else { return }
                             let url = FileManager.default.homeDirectoryForCurrentUser
-                                .appendingPathComponent("ligma/.user-attachment.png")
+                                .appendingPathComponent("pane/.user-attachment.png")
                             try? data.write(to: url)
                             DispatchQueue.main.async {
                                 viewModel.attachedImage = image
@@ -6025,52 +7259,158 @@ struct ThemeEditorPanel: View {
     var applyChange: (String, String) -> Void
     var applyAllToFile: ([(String, String)]) -> Void
 
-    @State private var showAddRow = false
-    @State private var newName = ""
-    @State private var newValue = ""
-    @State private var selectedFont: FontChoice = .system
-    @State private var selectedTemplate: ThemeTemplate?
+    @State private var fontHeading: FontChoice = .system
+    @State private var fontBody: FontChoice = .system
+    @State private var fontButton: FontChoice = .system
+    @State private var fontCaption: FontChoice = .system
+    @State private var customFontName: String = ""
+    @State private var customFontURL: URL?
+    @State private var showFontPicker = false
+    @State private var fontPickerTarget: String = "" // which role is picking a custom font
+    @State private var setupColors: [String: Color] = [:]
+
+    // Ordered list of color roles for the setup view
+    private let colorRoles = ["Background", "Surface", "Primary", "Secondary", "Accent", "Text"]
+
+    private let teal = Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255)
+    private let sectionBg = Color(red: 0x30/255, green: 0x30/255, blue: 0x30/255)
+    private let rowBg = Color(red: 0x38/255, green: 0x38/255, blue: 0x38/255)
+
+    // Preset tokens users can add from the + menu
+    private let addableTokens: [(label: String, name: String, value: String, icon: String)] = [
+        ("Background Color", "color-bg", "#FFFFFF", "paintbrush"),
+        ("Surface Color", "color-surface", "#F5F5F5", "square.fill"),
+        ("Text Color", "color-text", "#1A1A1A", "textformat"),
+        ("Accent Color", "color-accent", "#0F7DFF", "star.fill"),
+        ("Border Color", "color-border", "#E0E0E0", "square.dashed"),
+        ("Error Color", "color-error", "#E53E3E", "exclamationmark.circle"),
+        ("Success Color", "color-success", "#38A169", "checkmark.circle"),
+        ("Border Radius", "border-radius", "8px", "square.on.square"),
+        ("Spacing", "spacing", "16px", "arrow.left.and.right"),
+        ("Shadow", "shadow", "0 2px 8px rgba(0,0,0,0.1)", "shadow"),
+    ]
 
     private var hasDirtyTokens: Bool {
         state.themeTokens.contains { $0.isDirty }
     }
 
-    private func submitNewToken() {
-        let trimmed = newName.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        let val = newValue.trimmingCharacters(in: .whitespaces)
-        state.themeTokens.append(ThemeToken(name: trimmed, value: val, originalValue: ""))
-        applyChange(trimmed, val)
-        newName = ""
-        newValue = ""
-        showAddRow = false
+    private var colorTokens: [Binding<ThemeToken>] {
+        $state.themeTokens.filter { $0.wrappedValue.isColor }
     }
 
-    private func applyTemplate(_ template: ThemeTemplate) {
-        selectedTemplate = template
-        // Determine font choice from template
-        if let font = FontChoice.allCases.first(where: { $0.cssValue == template.fontFamily }) {
-            selectedFont = font
+    private var otherTokens: [Binding<ThemeToken>] {
+        $state.themeTokens.filter { !$0.wrappedValue.isColor }
+    }
+
+    /// Tokens from the preset list that haven't been added yet
+    private var availableToAdd: [(label: String, name: String, value: String, icon: String)] {
+        let existing = Set(state.themeTokens.map(\.name))
+        return addableTokens.filter { !existing.contains($0.name) }
+    }
+
+    private func addToken(name: String, value: String) {
+        state.themeTokens.append(ThemeToken(name: name, value: value, originalValue: ""))
+        applyChange(name, value)
+    }
+
+    private func hexFromColor(_ color: Color) -> String {
+        guard let srgb = NSColor(color).usingColorSpace(.sRGB) else { return "#000000" }
+        let r = Int(srgb.redComponent * 255)
+        let g = Int(srgb.greenComponent * 255)
+        let b = Int(srgb.blueComponent * 255)
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+
+    private func fontRow(_ label: String, selection: Binding<FontChoice>, role: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .frame(width: 52, alignment: .leading)
+
+            Menu {
+                ForEach(FontChoice.allCases) { font in
+                    Button {
+                        if font == .custom {
+                            fontPickerTarget = role
+                            showFontPicker = true
+                        } else {
+                            selection.wrappedValue = font
+                        }
+                    } label: {
+                        HStack {
+                            Text(font.displayName)
+                            if selection.wrappedValue == font {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selection.wrappedValue == .custom ? customFontName.isEmpty ? "Custom..." : customFontName : selection.wrappedValue.displayName)
+                        .font(.system(size: 10))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 7, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.22)))
+            }
+            .menuStyle(.borderlessButton)
         }
-        let tokens: [(String, String)] = [
-            ("color-bg", template.bgColor),
-            ("color-surface", template.surfaceColor),
-            ("color-text", template.textColor),
-            ("color-accent", template.accentColor),
-            ("font-family", template.fontFamily),
-        ]
-        state.themeTokens = tokens.map { ThemeToken(name: $0.0, value: $0.1, originalValue: "") }
-        for (name, value) in tokens {
-            applyChange(name, value)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(rowBg))
+    }
+
+    private func importCustomFont(url: URL) {
+        guard url.startAccessingSecurityScopedResource() else { return }
+        defer { url.stopAccessingSecurityScopedResource() }
+
+        let fontsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("pane/fonts")
+        try? FileManager.default.createDirectory(at: fontsDir, withIntermediateDirectories: true)
+
+        let dest = fontsDir.appendingPathComponent(url.lastPathComponent)
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.copyItem(at: url, to: dest)
+
+        customFontURL = dest
+        customFontName = url.deletingPathExtension().lastPathComponent
+
+        // Apply to whichever role triggered the picker
+        switch fontPickerTarget {
+        case "heading": fontHeading = .custom
+        case "body": fontBody = .custom
+        case "button": fontButton = .custom
+        case "caption": fontCaption = .custom
+        default: break
         }
     }
 
     private func applySetup() {
-        // Write design brief if in a project
+        var tokens: [(String, String)] = []
+        for role in colorRoles {
+            if let color = setupColors[role] {
+                let name = "color-\(role.lowercased())"
+                tokens.append((name, hexFromColor(color)))
+            }
+        }
+        if fontHeading != .system { tokens.append(("font-heading", fontHeading.cssValue)) }
+        if fontBody != .system { tokens.append(("font-body", fontBody.cssValue)) }
+        if fontButton != .system { tokens.append(("font-button", fontButton.cssValue)) }
+        if fontCaption != .system { tokens.append(("font-caption", fontCaption.cssValue)) }
+        state.themeTokens = tokens.map { ThemeToken(name: $0.0, value: $0.1, originalValue: "") }
+        for (name, value) in tokens {
+            applyChange(name, value)
+        }
         if case .project(let slug) = state.currentProject {
             writeDesignBrief(slug: slug, tokens: state.themeTokens, instructions: state.designInstructions)
         }
-        // Write starter preview
         state.skipInitialPreviewClear = true
         writeStarterPreview(tokens: state.themeTokens)
     }
@@ -6079,9 +7419,9 @@ struct ThemeEditorPanel: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("THEME")
-                    .font(.system(size: 11, weight: .heavy))
-                    .tracking(2)
+                Text("DESIGN TOKENS")
+                    .font(.system(size: 10, weight: .heavy))
+                    .tracking(1.5)
                     .foregroundStyle(.secondary)
 
                 Spacer()
@@ -6092,21 +7432,34 @@ struct ThemeEditorPanel: View {
                             .map { ($0.name, $0.value) }
                         applyAllToFile(dirty)
                     } label: {
-                        Text("Apply to File")
+                        Text("Sync")
                             .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(teal.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255))
+                    .foregroundStyle(teal)
                 }
 
-                Button {
-                    showAddRow = true
+                Menu {
+                    ForEach(availableToAdd, id: \.name) { item in
+                        Button {
+                            addToken(name: item.name, value: item.value)
+                        } label: {
+                            Label(item.label, systemImage: item.icon)
+                        }
+                    }
+                    if availableToAdd.isEmpty {
+                        Text("All tokens added")
+                    }
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 10, weight: .semibold))
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .menuStyle(.borderlessButton)
+                .frame(width: 16)
 
                 Button {
                     state.showThemeEditor = false
@@ -6123,234 +7476,238 @@ struct ThemeEditorPanel: View {
 
             Divider()
 
-            if state.themeTokens.isEmpty && !showAddRow {
-                // Setup mode — template picker, font, instructions
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Pick a starting palette")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 8)
-
-                        // Template cards
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(themeTemplates) { tmpl in
-                                    Button {
-                                        applyTemplate(tmpl)
-                                    } label: {
-                                        VStack(spacing: 4) {
-                                            HStack(spacing: 2) {
-                                                RoundedRectangle(cornerRadius: 2)
-                                                    .fill(Color(nsColor: NSColor(hex: tmpl.bgColor)))
-                                                    .frame(width: 14, height: 14)
-                                                RoundedRectangle(cornerRadius: 2)
-                                                    .fill(Color(nsColor: NSColor(hex: tmpl.surfaceColor)))
-                                                    .frame(width: 14, height: 14)
-                                                RoundedRectangle(cornerRadius: 2)
-                                                    .fill(Color(nsColor: NSColor(hex: tmpl.textColor)))
-                                                    .frame(width: 14, height: 14)
-                                                RoundedRectangle(cornerRadius: 2)
-                                                    .fill(Color(nsColor: NSColor(hex: tmpl.accentColor)))
-                                                    .frame(width: 14, height: 14)
-                                            }
-                                            Text(tmpl.displayName)
-                                                .font(.system(size: 9))
-                                                .foregroundStyle(.primary)
-                                        }
-                                        .padding(6)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .fill(selectedTemplate?.id == tmpl.id
-                                                    ? Color.accentColor.opacity(0.1)
-                                                    : Color.clear)
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(selectedTemplate?.id == tmpl.id
-                                                    ? Color.accentColor : Color.secondary.opacity(0.2),
-                                                    lineWidth: 1)
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                        }
-
-                        // Font picker
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Font")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Picker("Font", selection: $selectedFont) {
-                                ForEach(FontChoice.allCases) { font in
-                                    Text(font.rawValue.capitalized).tag(font)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .onChange(of: selectedFont) { _, newFont in
-                                // Update or add font-family token
-                                if let idx = state.themeTokens.firstIndex(where: { $0.name == "font-family" }) {
-                                    state.themeTokens[idx] = ThemeToken(
-                                        name: "font-family", value: newFont.cssValue, originalValue: "")
-                                } else if !state.themeTokens.isEmpty {
-                                    state.themeTokens.append(
-                                        ThemeToken(name: "font-family", value: newFont.cssValue, originalValue: ""))
-                                }
-                                applyChange("font-family", newFont.cssValue)
-                            }
-                        }
-                        .padding(.horizontal, 12)
-
-                        // Design instructions
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Design instructions")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            TextEditor(text: $state.designInstructions)
-                                .font(.system(size: 11))
-                                .frame(height: 56)
-                                .scrollContentBackground(.hidden)
-                                .padding(4)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .fill(.background)
-                                        .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
-                                )
-                                .overlay(
-                                    Group {
-                                        if state.designInstructions.isEmpty {
-                                            Text("e.g. Minimal, lots of whitespace, rounded corners...")
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(.tertiary)
-                                                .padding(.leading, 8)
-                                                .padding(.top, 8)
-                                                .allowsHitTesting(false)
-                                        }
-                                    }, alignment: .topLeading
-                                )
-                        }
-                        .padding(.horizontal, 12)
-
-                        // Apply button
-                        if selectedTemplate != nil {
-                            Button {
-                                applySetup()
-                            } label: {
-                                Text("Apply Theme")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 6)
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.white)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255))
-                            )
-                            .padding(.horizontal, 12)
-                        }
-                    }
-                    .padding(.bottom, 8)
-                }
+            if state.themeTokens.isEmpty {
+                setupView
             } else {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        if showAddRow {
-                            HStack(spacing: 6) {
-                                Text("--")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                TextField("name", text: $newName)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .frame(minWidth: 60)
-                                    .onSubmit { submitNewToken() }
-                                TextField("value", text: $newValue)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .frame(minWidth: 60)
-                                    .onSubmit { submitNewToken() }
-                                Button {
-                                    submitNewToken()
-                                } label: {
-                                    Image(systemName: "checkmark")
-                                        .font(.system(size: 10, weight: .semibold))
+                tokenEditorView
+            }
+        }
+        .frame(height: 260)
+    }
+
+    // MARK: - Setup (no tokens yet)
+
+    private var setupView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                // Color roles
+                sectionHeader("Colors")
+
+                LazyVGrid(columns: [
+                    GridItem(.flexible(), spacing: 6),
+                    GridItem(.flexible(), spacing: 6)
+                ], spacing: 6) {
+                    ForEach(colorRoles, id: \.self) { role in
+                        if let _ = setupColors[role] {
+                            HStack(spacing: 8) {
+                                ColorPicker("", selection: Binding(
+                                    get: { setupColors[role] ?? .white },
+                                    set: { setupColors[role] = $0 }
+                                ), supportsOpacity: false)
+                                .labelsHidden()
+                                .frame(width: 28, height: 28)
+
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(role)
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                    Text(hexFromColor(setupColors[role] ?? .white))
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
                                 }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(Color(red: 0x0C/255, green: 0x8C/255, blue: 0xE9/255))
+                                Spacer(minLength: 0)
+
                                 Button {
-                                    newName = ""
-                                    newValue = ""
-                                    showAddRow = false
+                                    setupColors.removeValue(forKey: role)
                                 } label: {
                                     Image(systemName: "xmark")
-                                        .font(.system(size: 10, weight: .semibold))
+                                        .font(.system(size: 8, weight: .semibold))
+                                        .foregroundStyle(.secondary)
                                 }
                                 .buttonStyle(.plain)
-                                .foregroundStyle(.secondary)
                             }
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, 8)
                             .padding(.vertical, 6)
-                            Divider().opacity(0.3)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(rowBg))
+                        } else {
+                            Button {
+                                setupColors[role] = .white
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus.circle")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                    Text(role)
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.1), style: StrokeStyle(lineWidth: 1, dash: [4])))
+                            }
+                            .buttonStyle(.plain)
                         }
-                        ForEach($state.themeTokens) { $token in
+                    }
+                }
+                .padding(.horizontal, 12)
+
+                // Typography
+                VStack(alignment: .leading, spacing: 6) {
+                    sectionHeader("Typography")
+
+                    VStack(spacing: 4) {
+                        fontRow("Heading", selection: $fontHeading, role: "heading")
+                        fontRow("Body", selection: $fontBody, role: "body")
+                        fontRow("Button", selection: $fontButton, role: "button")
+                        fontRow("Caption", selection: $fontCaption, role: "caption")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .fileImporter(isPresented: $showFontPicker, allowedContentTypes: [.font], allowsMultipleSelection: false) { result in
+                    if case .success(let urls) = result, let url = urls.first {
+                        importCustomFont(url: url)
+                    }
+                }
+
+                // Instructions
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("INSTRUCTIONS")
+                        .font(.system(size: 9, weight: .heavy))
+                        .tracking(1.2)
+                        .foregroundStyle(.tertiary)
+                    TextEditor(text: $state.designInstructions)
+                        .font(.system(size: 11))
+                        .frame(height: 48)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(rowBg))
+                        .overlay(
+                            Group {
+                                if state.designInstructions.isEmpty {
+                                    Text("Minimal, rounded corners, lots of whitespace...")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.tertiary)
+                                        .padding(.leading, 10)
+                                        .padding(.top, 10)
+                                        .allowsHitTesting(false)
+                                }
+                            }, alignment: .topLeading
+                        )
+                }
+                .padding(.horizontal, 12)
+
+                // Apply
+                Button { applySetup() } label: {
+                    Text("Apply Theme")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(RoundedRectangle(cornerRadius: 6).fill(teal))
+                .padding(.horizontal, 12)
+            }
+            .padding(.bottom, 10)
+        }
+    }
+
+    // MARK: - Token editor (has tokens)
+
+    private var tokenEditorView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                // Colors section
+                if !colorTokens.isEmpty {
+                    sectionHeader("Colors")
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(), spacing: 6),
+                        GridItem(.flexible(), spacing: 6)
+                    ], spacing: 6) {
+                        ForEach(colorTokens) { $token in
+                            ThemeColorSwatch(token: $token, onChanged: { name, value in
+                                applyChange(name, value)
+                            })
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                }
+
+                // Other tokens section
+                if !otherTokens.isEmpty {
+                    sectionHeader("Other")
+
+                    VStack(spacing: 0) {
+                        ForEach(otherTokens) { $token in
                             ThemeTokenRow(token: $token, onChanged: { name, value in
                                 applyChange(name, value)
                             })
-                            Divider().opacity(0.3)
+                            if token.id != otherTokens.last?.wrappedValue.id {
+                                Divider().opacity(0.2).padding(.horizontal, 12)
+                            }
                         }
                     }
                 }
             }
+            .padding(.bottom, 8)
         }
-        .frame(height: 240)
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 9, weight: .heavy))
+            .tracking(1.2)
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
     }
 }
 
-struct ThemeTokenRow: View {
+// MARK: - Color Swatch (grid item)
+
+struct ThemeColorSwatch: View {
     @Binding var token: ThemeToken
     var onChanged: (String, String) -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Text("--\(token.name)")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .frame(minWidth: 80, alignment: .leading)
+            ColorPicker("", selection: colorBinding, supportsOpacity: false)
+                .labelsHidden()
+                .frame(width: 28, height: 28)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
 
-            Spacer()
-
-            if token.isColor {
-                ColorPicker("", selection: colorBinding, supportsOpacity: false)
-                    .labelsHidden()
-                    .frame(width: 24, height: 24)
-
-                Text(token.value)
-                    .font(.system(size: 10, design: .monospaced))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(token.name)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(token.value.uppercased())
+                    .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: 70, alignment: .leading)
-            } else {
-                TextField("", text: $token.value)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 120)
-                    .onSubmit {
-                        onChanged(token.name, token.value)
-                    }
             }
+
+            Spacer(minLength: 0)
 
             if token.isDirty {
-                Circle()
-                    .fill(.orange)
-                    .frame(width: 6, height: 6)
+                if !token.validationState.isValid {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                } else {
+                    Circle().fill(.orange).frame(width: 5, height: 5)
+                }
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
         .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(red: 0x38/255, green: 0x38/255, blue: 0x38/255))
+        )
     }
 
     private var colorBinding: Binding<Color> {
@@ -6366,6 +7723,64 @@ struct ThemeTokenRow: View {
                 onChanged(token.name, hex)
             }
         )
+    }
+}
+
+// MARK: - Token Row (non-color)
+
+struct ThemeTokenRow: View {
+    @Binding var token: ThemeToken
+    var onChanged: (String, String) -> Void
+    @State private var debounceWork: DispatchWorkItem?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if token.isColor && token.validationState.isValid {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color(nsColor: NSColor(hex: token.value)))
+                    .frame(width: 16, height: 16)
+            }
+
+            Text(token.name)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .frame(minWidth: 70, alignment: .leading)
+
+            Spacer()
+
+            TextField("", text: $token.value)
+                .font(.system(size: 10, design: .monospaced))
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 140)
+                .onChange(of: token.value) { _, newValue in
+                    debounceWork?.cancel()
+                    guard token.validationState.isValid else { return }
+                    let name = token.name
+                    let work = DispatchWorkItem { [name, newValue] in
+                        onChanged(name, newValue)
+                    }
+                    debounceWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                }
+                .onSubmit {
+                    debounceWork?.cancel()
+                    onChanged(token.name, token.value)
+                }
+
+            if token.isDirty {
+                if case .invalid(let reason) = token.validationState {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                        .help(reason)
+                } else {
+                    Circle().fill(.orange).frame(width: 5, height: 5)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
     }
 }
 
@@ -6408,6 +7823,7 @@ struct PreviewWebView: NSViewRepresentable {
         var source: DispatchSourceFileSystemObject?
         var debounceWork: DispatchWorkItem?
         var snapshotDebounceWork: DispatchWorkItem?
+        private let snapshotQueue = DispatchQueue(label: "com.pane.snapshots")
         var reloadObserver: Any?
         var prevVersionObserver: Any?
         var nextVersionObserver: Any?
@@ -6418,6 +7834,7 @@ struct PreviewWebView: NSViewRepresentable {
         var themeWriteObserver: Any?
         var elementPickerObserver: Any?
         var elementPickerDeactivateObserver: Any?
+        var saveVersionMetaObserver: Any?
         weak var webView: WKWebView?
         weak var state: AppState?
 
@@ -6434,9 +7851,9 @@ struct PreviewWebView: NSViewRepresentable {
 
         override init() {
             previewPath = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("ligma/preview.html").path
+                .appendingPathComponent("pane/preview.html").path
             versionsDir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("ligma/.versions")
+                .appendingPathComponent("pane/.versions")
             super.init()
         }
 
@@ -6457,10 +7874,15 @@ struct PreviewWebView: NSViewRepresentable {
 
             reloadObserver = NotificationCenter.default.addObserver(
                 forName: .reloadPreview, object: nil, queue: .main
-            ) { [weak self] _ in
+            ) { [weak self] notification in
                 self?.state?.isBrowsingHistory = false
                 self?.state?.newVersionsWhileBrowsing = 0
-                self?.loadPreview()
+                if let js = notification.object as? String {
+                    // Section navigation — just run the JS, don't reload
+                    self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+                } else {
+                    self?.loadPreview()
+                }
             }
 
             prevVersionObserver = NotificationCenter.default.addObserver(
@@ -6504,20 +7926,27 @@ struct PreviewWebView: NSViewRepresentable {
                 forName: .deactivateElementPicker, object: nil, queue: .main
             ) { [weak self] _ in self?.deactivateElementPickerJS() }
 
+            saveVersionMetaObserver = NotificationCenter.default.addObserver(
+                forName: .saveVersionMeta, object: nil, queue: .main
+            ) { [weak self] _ in self?.saveVersionMeta() }
+
         }
 
         // MARK: Clear Version History
 
         func clearVersionHistory() {
             let fm = FileManager.default
+            let dir = versionsDir
 
-            // Remove version files
-            if let files = try? fm.contentsOfDirectory(atPath: versionsDir.path) {
-                for file in files where file.hasSuffix(".html") {
-                    try? fm.removeItem(at: versionsDir.appendingPathComponent(file))
+            // Remove version files on the snapshot queue to avoid races
+            snapshotQueue.sync {
+                if let files = try? fm.contentsOfDirectory(atPath: dir.path) {
+                    for file in files {
+                        try? fm.removeItem(at: dir.appendingPathComponent(file))
+                    }
                 }
             }
-            try? fm.removeItem(at: home.appendingPathComponent("ligma/.preview-screenshot-annotated.png"))
+            try? fm.removeItem(at: home.appendingPathComponent("pane/.preview-screenshot-annotated.png"))
 
             // Truncate preview.html using FileHandle (works when String.write fails)
             if let fh = FileHandle(forWritingAtPath: previewPath) {
@@ -6527,6 +7956,8 @@ struct PreviewWebView: NSViewRepresentable {
 
             // Clear AppState
             state?.versions.removeAll()
+            state?.versionMeta.removeAll()
+            state?.isComparingVersions = false
             state?.currentVersionIndex = 0
             state?.isBrowsingHistory = false
             state?.newVersionsWhileBrowsing = 0
@@ -6600,6 +8031,37 @@ struct PreviewWebView: NSViewRepresentable {
             }
 
             state.currentVersionIndex = max(0, state.versions.count - 1)
+            loadVersionMeta()
+        }
+
+        var metaFilePath: URL {
+            versionsDir.appendingPathComponent("versions-meta.json")
+        }
+
+        func loadVersionMeta() {
+            guard let state else { return }
+            guard let data = try? Data(contentsOf: metaFilePath),
+                  let meta = try? JSONDecoder().decode([String: VersionMeta].self, from: data) else {
+                return
+            }
+            state.versionMeta = meta
+        }
+
+        func saveVersionMeta() {
+            guard let state else { return }
+            guard let data = try? JSONEncoder().encode(state.versionMeta) else { return }
+            try? data.write(to: metaFilePath)
+        }
+
+        func setVersionLabel(_ label: String, for filename: String) {
+            guard let state else { return }
+            if var meta = state.versionMeta[filename] {
+                meta.label = label.isEmpty ? nil : label
+                state.versionMeta[filename] = meta
+            } else {
+                state.versionMeta[filename] = VersionMeta(label: label.isEmpty ? nil : label, timestamp: Date())
+            }
+            saveVersionMeta()
         }
 
         func scheduleSnapshot(html: String) {
@@ -6609,6 +8071,49 @@ struct PreviewWebView: NSViewRepresentable {
             }
             snapshotDebounceWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+        }
+
+        func saveExtractionBaseline(html: String, slug: String) {
+            let fm = FileManager.default
+            let projectDir = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("pane/library/\(slug)")
+            try? fm.createDirectory(at: projectDir, withIntermediateDirectories: true)
+            let dest = projectDir.appendingPathComponent(".extraction-baseline.html")
+            try? html.write(to: dest, atomically: true, encoding: .utf8)
+        }
+
+        func autoSaveToLibrary(html: String, slug: String) {
+            guard let webView else { return }
+            let fm = FileManager.default
+            let libraryDir = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("pane/library/\(slug)")
+            try? fm.createDirectory(at: libraryDir, withIntermediateDirectories: true)
+
+            // Extract each section as a standalone HTML file
+            let js = """
+            (() => {
+                const sections = document.querySelectorAll('section[id]');
+                if (sections.length === 0) return [];
+                const head = document.head.innerHTML;
+                return Array.from(sections).map(s => ({
+                    id: s.id,
+                    html: '<!DOCTYPE html><html><head>' + head + '</head><body>' + s.outerHTML + '</body></html>'
+                }));
+            })()
+            """
+            webView.evaluateJavaScript(js) { result, _ in
+                guard let sections = result as? [[String: String]], !sections.isEmpty else {
+                    // No sections found — save as single file
+                    let dest = libraryDir.appendingPathComponent("full-mockup.html")
+                    try? html.write(to: dest, atomically: true, encoding: .utf8)
+                    return
+                }
+                for section in sections {
+                    guard let id = section["id"], let sectionHTML = section["html"] else { continue }
+                    let dest = libraryDir.appendingPathComponent("\(id).html")
+                    try? sectionHTML.write(to: dest, atomically: true, encoding: .utf8)
+                }
+            }
         }
 
         func saveSnapshot(html: String) {
@@ -6622,24 +8127,35 @@ struct PreviewWebView: NSViewRepresentable {
             isSnapshotting = true
             let filename = String(format: "%03d.html", versionCounter)
             let url = versionsDir.appendingPathComponent(filename)
-            try? html.write(to: url, atomically: true, encoding: .utf8)
-            versionCounter += 1
-            isSnapshotting = false
+            let dir = versionsDir
+            snapshotQueue.async { [weak self] in
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try? html.write(to: url, atomically: true, encoding: .utf8)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.versionCounter += 1
 
-            state.versions.append(url)
+                    state.versionMeta[filename] = VersionMeta(label: nil, timestamp: Date())
+                    self.saveVersionMeta()
 
-            while state.versions.count > maxVersions {
-                let oldest = state.versions.removeFirst()
-                try? FileManager.default.removeItem(at: oldest)
-                if state.isBrowsingHistory {
-                    state.currentVersionIndex = max(0, state.currentVersionIndex - 1)
+                    state.versions.append(url)
+
+                    while state.versions.count > self.maxVersions {
+                        let oldest = state.versions.removeFirst()
+                        try? FileManager.default.removeItem(at: oldest)
+                        if state.isBrowsingHistory {
+                            state.currentVersionIndex = max(0, state.currentVersionIndex - 1)
+                        }
+                    }
+
+                    if state.isBrowsingHistory {
+                        state.newVersionsWhileBrowsing += 1
+                    } else {
+                        state.currentVersionIndex = state.versions.count - 1
+                    }
+
+                    self.isSnapshotting = false
                 }
-            }
-
-            if state.isBrowsingHistory {
-                state.newVersionsWhileBrowsing += 1
-            } else {
-                state.currentVersionIndex = state.versions.count - 1
             }
         }
 
@@ -6713,6 +8229,10 @@ struct PreviewWebView: NSViewRepresentable {
                 if let updated = state?.currentProjectInfo {
                     saveProjectInfo(updated)
                 }
+                // Auto-save the full preview as the initial view in library
+                autoSaveToLibrary(html: html, slug: info.slug)
+                // Save extraction baseline for diffing during apply
+                saveExtractionBaseline(html: html, slug: info.slug)
             }
 
             // Only clear sketches when the HTML content actually changes
@@ -6788,7 +8308,7 @@ struct PreviewWebView: NSViewRepresentable {
                       let bitmap = NSBitmapImageRep(data: tiff),
                       let png = bitmap.representation(using: .png, properties: [:]) else { return }
                 let screenshotURL = FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("ligma/.preview-screenshot.png")
+                    .appendingPathComponent("pane/.preview-screenshot.png")
                 try? png.write(to: screenshotURL)
             }
         }
@@ -6803,13 +8323,13 @@ struct PreviewWebView: NSViewRepresentable {
                 if annotations.isEmpty {
                     // No sketches — remove annotated file so Claude doesn't read stale markups
                     try? FileManager.default.removeItem(
-                        at: home.appendingPathComponent("ligma/.preview-screenshot-annotated.png"))
+                        at: home.appendingPathComponent("pane/.preview-screenshot-annotated.png"))
                 } else {
                     let annotated = Self.compositeSketch(onto: image, annotations: annotations)
                     guard let tiff = annotated.tiffRepresentation,
                           let bitmap = NSBitmapImageRep(data: tiff),
                           let png = bitmap.representation(using: .png, properties: [:]) else { return }
-                    try? png.write(to: home.appendingPathComponent("ligma/.preview-screenshot-annotated.png"))
+                    try? png.write(to: home.appendingPathComponent("pane/.preview-screenshot-annotated.png"))
                 }
             }
         }
@@ -6869,9 +8389,12 @@ struct PreviewWebView: NSViewRepresentable {
             }
 
             isSnapshotting = true
-            try? html.write(toFile: previewPath, atomically: true, encoding: .utf8)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                self?.isSnapshotting = false
+            let path = previewPath
+            snapshotQueue.async { [weak self] in
+                try? html.write(toFile: path, atomically: true, encoding: .utf8)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self?.isSnapshotting = false
+                }
             }
 
             // Reset dirty state
@@ -7188,6 +8711,69 @@ struct PreviewWebView: NSViewRepresentable {
             if let obs = themeWriteObserver { NotificationCenter.default.removeObserver(obs) }
             if let obs = elementPickerObserver { NotificationCenter.default.removeObserver(obs) }
             if let obs = elementPickerDeactivateObserver { NotificationCenter.default.removeObserver(obs) }
+            if let obs = saveVersionMetaObserver { NotificationCenter.default.removeObserver(obs) }
         }
     }
+}
+
+// MARK: - Version Compare View
+
+struct VersionCompareView: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                if let left = state.compareLeftIndex, let right = state.compareRightIndex {
+                    Text("Version \(left + 1)")
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    Text("vs")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Version \(right + 1)")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                Spacer()
+                Button {
+                    state.isComparingVersions = false
+                    state.compareLeftIndex = nil
+                    state.compareRightIndex = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(red: 0x2A/255, green: 0x2A/255, blue: 0x2A/255))
+
+            HStack(spacing: 1) {
+                if let left = state.compareLeftIndex, left < state.versions.count {
+                    CompareWebView(url: state.versions[left])
+                }
+                if let right = state.compareRightIndex, right < state.versions.count {
+                    CompareWebView(url: state.versions[right])
+                }
+            }
+        }
+        .background(Color(red: 0x1E/255, green: 0x1E/255, blue: 0x1E/255))
+    }
+}
+
+struct CompareWebView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> WKWebView {
+        let webView = WKWebView()
+        if let html = try? String(contentsOf: url, encoding: .utf8) {
+            webView.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
+        }
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
 }

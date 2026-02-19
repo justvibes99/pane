@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "Ligma",
+    name: "Pane",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "Ligma",
+            name: "Pane",
             path: "Sources",
             resources: [
-                .copy("ligma-logo.png"),
+                .copy("pane-logo.png"),
                 .copy("AppIcon.icns")
             ]
         )

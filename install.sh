@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_NAME="Ligma"
-BUNDLE_ID="com.ben.ligma"
+APP_NAME="Pane"
+BUNDLE_ID="com.ben.pane"
 APP_DIR="$HOME/Applications/${APP_NAME}.app"
 CONTENTS="$APP_DIR/Contents"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,6 +11,10 @@ echo "Building ${APP_NAME} (release)..."
 cd "$SCRIPT_DIR"
 swift build -c release -q
 
+# Kill running instance so macOS doesn't invalidate the code signature
+pkill -9 Mockup 2>/dev/null || true
+sleep 0.5
+
 echo "Assembling app bundle..."
 mkdir -p "$CONTENTS/MacOS"
 mkdir -p "$CONTENTS/Resources"
@@ -18,7 +22,7 @@ mkdir -p "$CONTENTS/Resources"
 cp -f ".build/arm64-apple-macosx/release/$APP_NAME" "$CONTENTS/MacOS/Mockup"
 
 # Resource bundle (contains icon + logo)
-BUNDLE_SRC=".build/arm64-apple-macosx/release/Ligma_Ligma.bundle"
+BUNDLE_SRC=".build/arm64-apple-macosx/release/Pane_Pane.bundle"
 if [ -d "$BUNDLE_SRC" ]; then
     cp -Rf "$BUNDLE_SRC" "$CONTENTS/Resources/"
 fi
